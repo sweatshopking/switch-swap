@@ -71,7 +71,7 @@ jobs:
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
             --output /usr/local/bin/linuxdeploy
           curl --fail --location --retry 3 \
-            https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/releases/download/continuous/linuxdeploy-plugin-gtk.sh \
+            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh \
             --output /usr/local/bin/linuxdeploy-plugin-gtk.sh
           chmod +x /usr/local/bin/linuxdeploy /usr/local/bin/linuxdeploy-plugin-gtk.sh
           echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "${GITHUB_ENV}"

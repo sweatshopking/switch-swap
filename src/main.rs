@@ -1,5 +1,6 @@
 mod daemon;
 mod gui;
+mod installer;
 mod mapping;
 
 use std::error::Error;
@@ -19,6 +20,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("service") => daemon::run(),
+        Some("install-service") => {
+            if args.next().is_some() {
+                return Err("Usage: switch-swap install-service".into());
+            }
+            installer::install_service()
+        }
         Some("apply") => {
             let layout = args.next().ok_or("Usage: switch-swap apply xbox|switch")?;
             if args.next().is_some() {

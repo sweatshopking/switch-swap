@@ -25,6 +25,12 @@ fn build_window(application: &Application) {
     let details = Label::new(Some(""));
     details.set_wrap(true);
     details.set_xalign(0.0);
+    let setup = Label::new(Some(
+        "First-time setup — 1. Install the system service. 2. Connect a controller. 3. Choose a button layout.",
+    ));
+    setup.set_wrap(true);
+    setup.set_xalign(0.0);
+    let install_service = Button::with_label("Install system service…");
 
     let xbox = Button::with_label("Use Xbox button layout");
     let switch = Button::with_label("Use Nintendo Switch button layout");
@@ -36,6 +42,7 @@ fn build_window(application: &Application) {
         .or_else(|| std::env::current_exe().ok());
 
     for (button, action, label) in [
+        (install_service.clone(), "install-service", ""),
         (xbox.clone(), "apply", "xbox"),
         (switch.clone(), "apply", "switch"),
         (undo.clone(), "disable", ""),
@@ -61,8 +68,11 @@ fn build_window(application: &Application) {
             match command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
                 Ok(child) => {
                     *pending_child.borrow_mut() = Some(child);
-                    *action_message.borrow_mut() =
-                        "Waiting for administrator authorization…".to_owned();
+                    *action_message.borrow_mut() = if action == "install-service" {
+                        "Review the administrator prompt to install the service…".to_owned()
+                    } else {
+                        "Waiting for administrator authorization…".to_owned()
+                    };
                 }
                 Err(error) => {
                     *action_message.borrow_mut() = format!(
@@ -79,6 +89,8 @@ fn build_window(application: &Application) {
     content.set_margin_start(20);
     content.set_margin_end(20);
     content.append(&Label::new(Some("Switch Swap")));
+    content.append(&setup);
+    content.append(&install_service);
     content.append(&status);
     content.append(&details);
     content.append(&xbox);
@@ -92,44 +104,81 @@ fn build_window(application: &Application) {
         .application(application)
         .title("Switch Swap")
         .default_width(420)
-        .default_height(300)
+        .default_height(440)
         .child(&content)
         .build();
     window.present();
 
     let status_label = status.clone();
     let details_label = details.clone();
+    let setup_label = setup.clone();
+    let install_button = install_service.clone();
+    let xbox_button = xbox.clone();
+    let switch_button = switch.clone();
+    let undo_button = undo.clone();
     glib::timeout_add_local(Duration::from_secs(1), move || {
-        if let Some(child) = pending_child.borrow_mut().as_mut() {
-            match child.try_wait() {
-                Ok(Some(exit)) => {
-                    let message = if exit.success() {
-                        "Administrator request completed.".to_owned()
-                    } else {
-                        format!("Administrator request ended with {exit}.")
-                    };
-                    *action_message.borrow_mut() = message;
-                    *pending_child.borrow_mut() = None;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    *action_message.borrow_mut() =
-                        format!("Cannot check administrator request: {error}");
-                    *pending_child.borrow_mut() = None;
+        let child_status = pending_child.borrow_mut().as_mut().map(Child::try_wait);
+        match child_status {
+            Some(Ok(Some(_))) => {
+                if let Some(child) = pending_child.borrow_mut().take() {
+                    match child.wait_with_output() {
+                        Ok(output) => {
+                            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                            let message = if output.status.success() {
+                                let stdout =
+                                    String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                                if stdout.is_empty() {
+                                    "Administrator request completed.".to_owned()
+                                } else {
+                                    stdout
+                                }
+                            } else if detail.is_empty() {
+                                format!("Administrator request ended with {}.", output.status)
+                            } else {
+                                format!("Administrator request failed: {detail}")
+                            };
+                            *action_message.borrow_mut() = message;
+                        }
+                        Err(error) => {
+                            *action_message.borrow_mut() =
+                                format!("Cannot read administrator request result: {error}");
+                        }
+                    }
                 }
             }
+            Some(Ok(None)) => {}
+            Some(Err(error)) => {
+                *action_message.borrow_mut() =
+                    format!("Cannot check administrator request: {error}");
+                pending_child.borrow_mut().take();
+            }
+            None => {}
         }
 
         match read_status() {
             Ok((service, controller_details)) => {
                 status_label.set_text(&format!("{} {}", service, action_message.borrow()));
                 details_label.set_text(&controller_details);
+                setup_label.set_text(
+                    "Step 1 complete — connect a controller, then choose the button layout you want below.",
+                );
+                install_button.set_visible(false);
+                xbox_button.set_sensitive(true);
+                switch_button.set_sensitive(true);
+                undo_button.set_sensitive(true);
             }
             Err(error) => {
                 status_label.set_text(&format!("{} {}", error, action_message.borrow()));
                 details_label.set_text(
-                    "If this is a fresh setup, run the included install.sh with sudo, then reopen the app.",
+                    "The installer will request administrator approval before copying files or enabling the system service.",
                 );
+                setup_label.set_text(
+                    "First-time setup — 1. Install the service (administrator approval required). 2. Connect a controller. 3. Choose Xbox or Nintendo Switch layout.",
+                );
+                install_button.set_visible(true);
+                xbox_button.set_sensitive(false);
+                switch_button.set_sensitive(false);
+                undo_button.set_sensitive(false);
             }
         }
         glib::ControlFlow::Continue

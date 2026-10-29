@@ -28,15 +28,14 @@ All commands below are run from this project directory:
 ```sh
 cargo test
 cargo build --release
-sudo ./install.sh
-switch-swap
+./target/release/switch-swap
 ```
 
-The installer installs the executable and systemd service under `/usr/bin` and `/etc`, then enables the service. It requires root privileges and is intentionally not run by the development build. Apply/Undo prompts for administrator authorization using polkit; do not launch the GUI as root.
+On first launch, the setup screen explains the steps. Choose **Install system service** to request administrator approval through polkit. Only after approval does the installer copy the app to `/usr/bin` (or `/opt/switch-swap` for an AppImage), add its systemd service and default settings, and enable the service. Remapping remains off until you choose a layout. Do not launch the GUI as root.
 
 Prebuilt x86_64 `.deb`, `.rpm`, and AppImage files are attached to the [GitHub Releases](https://github.com/sweatshopking/switch-swap/releases) page. Debian/Ubuntu users can install the `.deb` with `sudo apt install ./switch-swap_VERSION_amd64.deb`; Fedora-compatible users can use `sudo dnf install ./switch-swap-VERSION-1.x86_64.rpm`. These packages install and enable the system service.
 
-On CachyOS, download and launch the AppImage as your regular user. To enable its persistent, system-wide remapping service, also download `install-appimage.sh` from that release and run `sudo bash install-appimage.sh ./Switch-Swap-VERSION-x86_64.AppImage`. This copies the AppImage into `/opt/switch-swap` so systemd can use it after reboot. To remove the AppImage-based service, run `sudo systemctl disable --now switch-swap.service`, then remove `/etc/systemd/system/switch-swap.service` and `/opt/switch-swap/switch-swap.AppImage`.
+On CachyOS, download and launch the AppImage as your regular user, then choose **Install system service** in the setup screen and approve the polkit prompt. This copies the AppImage into `/opt/switch-swap` so systemd can use it after reboot. The release also includes `install-appimage.sh` for manual installation. To remove the AppImage-based service, run `sudo systemctl disable --now switch-swap.service`, then remove `/etc/systemd/system/switch-swap.service` and `/opt/switch-swap/switch-swap.AppImage`.
 
 The published binaries target x86_64. `SHA256SUMS` is included with each release. Package installation starts the service with remapping disabled by default; choose a layout in the GUI to enable it.
 
