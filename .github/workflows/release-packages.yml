@@ -84,7 +84,7 @@ jobs:
           dpkg-deb --info "dist/switch-swap_${{ steps.version.outputs.version }}_amd64.deb"
           rpm -qip "dist/switch-swap-${{ steps.version.outputs.version }}-1.x86_64.rpm"
           file dist/*.AppImage
-          sha256sum --check dist/SHA256SUMS
+          (cd dist && sha256sum --check SHA256SUMS)
           APPIMAGE_EXTRACT_AND_RUN=1 \
             "dist/Switch-Swap-${{ steps.version.outputs.version }}-x86_64.AppImage" --version
 
