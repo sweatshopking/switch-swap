@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Switch Swap
+Comment=Swap Xbox and Nintendo Switch controller button layouts
+Exec=switch-swap
+Icon=io.github.switchswap.SwitchSwap
+Terminal=false
+Type=Application
+Categories=Game;
+StartupNotify=true

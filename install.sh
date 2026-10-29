@@ -13,7 +13,7 @@ if [[ ! -x "${binary}" ]]; then
     exit 1
 fi
 
-install -Dm755 "${binary}" /usr/local/bin/switch-swap
+install -Dm755 "${binary}" /usr/bin/switch-swap
 install -Dm644 "${project_dir}/systemd/switch-swap.service" \
     /etc/systemd/system/switch-swap.service
 install -d -m755 /etc/switch-swap

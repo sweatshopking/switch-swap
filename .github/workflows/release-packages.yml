@@ -1,0 +1,101 @@
+name: Build and publish Linux packages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to package (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Select release version
+        id: version
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${INPUT_TAG}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          version="${tag#v}"
+          expected="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ "${version}" != "${expected}" ]]; then
+            echo "Tag version ${version} does not match Cargo.toml version ${expected}." >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install native build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential pkg-config libgtk-4-dev \
+            libgirepository1.0-dev librsvg2-dev dpkg-dev rpm desktop-file-utils \
+            file curl patchelf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+          desktop-file-validate packaging/switch-swap.desktop
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Install linuxdeploy and GTK bundling plugin
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+            --output /usr/local/bin/linuxdeploy
+          curl --fail --location --retry 3 \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/releases/download/continuous/linuxdeploy-plugin-gtk.sh \
+            --output /usr/local/bin/linuxdeploy-plugin-gtk.sh
+          chmod +x /usr/local/bin/linuxdeploy /usr/local/bin/linuxdeploy-plugin-gtk.sh
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "${GITHUB_ENV}"
+
+      - name: Build .deb, .rpm, and AppImage
+        run: packaging/build-release.sh "${{ steps.version.outputs.version }}"
+
+      - name: Verify package artifacts
+        run: |
+          dpkg-deb --info "dist/switch-swap_${{ steps.version.outputs.version }}_amd64.deb"
+          rpm -qip "dist/switch-swap-${{ steps.version.outputs.version }}-1.x86_64.rpm"
+          file dist/*.AppImage
+          sha256sum --check dist/SHA256SUMS
+          APPIMAGE_EXTRACT_AND_RUN=1 \
+            "dist/Switch-Swap-${{ steps.version.outputs.version }}-x86_64.AppImage" --version
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+            dist/SHA256SUMS
+            packaging/install-appimage.sh

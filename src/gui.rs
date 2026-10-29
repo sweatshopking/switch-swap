@@ -31,7 +31,9 @@ fn build_window(application: &Application) {
     let undo = Button::with_label("Undo remapping");
     let action_message = Rc::new(RefCell::new(String::new()));
     let pending_child = Rc::new(RefCell::new(None::<Child>));
-    let executable = std::env::current_exe().ok();
+    let executable = std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok());
 
     for (button, action, label) in [
         (xbox.clone(), "apply", "xbox"),

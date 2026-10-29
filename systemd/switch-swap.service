@@ -4,7 +4,7 @@ After=systemd-udevd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/switch-swap service
+ExecStart=/usr/bin/switch-swap service
 User=root
 Group=root
 RuntimeDirectory=switch-swap

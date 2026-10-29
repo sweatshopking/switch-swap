@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+systemctl daemon-reload
+deb-systemd-invoke enable switch-swap.service
+if [ "$1" = configure ]; then
+    deb-systemd-invoke start switch-swap.service
+fi
+exit 0
