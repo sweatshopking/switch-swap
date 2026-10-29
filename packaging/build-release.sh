@@ -69,7 +69,13 @@ install -m644 packaging/io.github.switchswap.SwitchSwap.svg "${rpm_root}/SOURCES
 rpmbuild -bb packaging/rpm/switch-swap.spec \
     --define "_topdir ${rpm_root}" \
     --define "version ${version}" \
-    --define "_rpmdir ${dist}"
+    --define "_rpmdir ${rpm_root}/RPMS"
+rpm_artifact="${rpm_root}/RPMS/x86_64/switch-swap-${version}-1.x86_64.rpm"
+if [[ ! -f "${rpm_artifact}" ]]; then
+    echo "rpmbuild succeeded but the expected RPM was not found at ${rpm_artifact}." >&2
+    exit 1
+fi
+install -m644 "${rpm_artifact}" "${dist}/"
 
 appdir="${work}/SwitchSwap.AppDir"
 install -d "${appdir}/usr/bin" "${appdir}/usr/share/applications" \
