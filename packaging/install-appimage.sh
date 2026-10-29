@@ -21,7 +21,7 @@ install -Dm755 "${image}" /opt/switch-swap/switch-swap.AppImage
 install -d -m755 /etc/switch-swap
 if [[ ! -e /etc/switch-swap/settings.conf ]]; then
     install -m600 /dev/null /etc/switch-swap/settings.conf
-    printf 'enabled=false\nlayout=xbox\n' > /etc/switch-swap/settings.conf
+    printf 'version=2\n' > /etc/switch-swap/settings.conf
 fi
 install -d -m755 /etc/systemd/system
 cat > /etc/systemd/system/switch-swap.service <<'EOF'
@@ -50,7 +50,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX
 DevicePolicy=closed
-DeviceAllow=/dev/input/event* rw
+DeviceAllow=char-input rw
 DeviceAllow=/dev/uinput rw
 
 [Install]

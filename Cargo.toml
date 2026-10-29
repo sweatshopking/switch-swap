@@ -1,6 +1,6 @@
 [package]
 name = "switch-swap"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.92"
 description = "System-wide Xbox and Nintendo-style controller face-button remapping for Linux"

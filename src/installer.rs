@@ -8,7 +8,11 @@ use std::process::Command;
 const SERVICE_UNIT_PATH: &str = "/etc/systemd/system/switch-swap.service";
 const SETTINGS_PATH: &str = "/etc/switch-swap/settings.conf";
 const APPIMAGE_PATH: &str = "/opt/switch-swap/switch-swap.AppImage";
+const DEVICE_ACCESS_DROPIN_PATH: &str =
+    "/etc/systemd/system/switch-swap.service.d/10-controller-device-access.conf";
 const SERVICE_UNIT: &str = include_str!("../systemd/switch-swap.service");
+const DEVICE_ACCESS_DROPIN: &str =
+    include_str!("../systemd/switch-swap.service.d/10-controller-device-access.conf");
 
 pub fn install_service() -> Result<(), Box<dyn Error>> {
     if unsafe { libc::geteuid() } != 0 {
@@ -37,11 +41,38 @@ pub fn install_service() -> Result<(), Box<dyn Error>> {
         )
     };
 
-    if Path::new(SERVICE_UNIT_PATH).exists()
-        || Path::new("/usr/lib/systemd/system/switch-swap.service").exists()
-    {
+    let packaged_unit = Path::new("/usr/lib/systemd/system/switch-swap.service");
+    if Path::new(SERVICE_UNIT_PATH).exists() || packaged_unit.exists() {
+        let unit_path = if Path::new(SERVICE_UNIT_PATH).exists() {
+            Path::new(SERVICE_UNIT_PATH)
+        } else {
+            packaged_unit
+        };
+        let existing_unit = fs::read_to_string(unit_path)
+            .map_err(|error| format!("Cannot read {}: {error}", unit_path.display()))?;
+        let destination = if existing_unit.contains(APPIMAGE_PATH) {
+            PathBuf::from(APPIMAGE_PATH)
+        } else if existing_unit.contains("/usr/bin/switch-swap") {
+            PathBuf::from("/usr/bin/switch-swap")
+        } else {
+            return Err(format!(
+                "{} does not use a supported Switch Swap executable path.",
+                unit_path.display()
+            )
+            .into());
+        };
+        install_executable(&binary_source, &destination)?;
+        create_default_settings()?;
+        replace_file(
+            Path::new(DEVICE_ACCESS_DROPIN_PATH),
+            DEVICE_ACCESS_DROPIN.as_bytes(),
+            0o644,
+        )?;
         systemctl(&["daemon-reload"])?;
-        return systemctl(&["enable", "--now", "switch-swap.service"]);
+        systemctl(&["enable", "--now", "switch-swap.service"])?;
+        systemctl(&["restart", "switch-swap.service"])?;
+        println!("Switch Swap application and system service updated.");
+        return Ok(());
     }
 
     install_executable(&binary_source, &binary_destination)?;
@@ -54,15 +85,11 @@ pub fn install_service() -> Result<(), Box<dyn Error>> {
 }
 
 fn install_executable(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
-    if source.canonicalize().ok() == destination.canonicalize().ok() {
+    if let (Ok(source_path), Ok(destination_path)) =
+        (source.canonicalize(), destination.canonicalize())
+        && source_path == destination_path
+    {
         return Ok(());
-    }
-    if destination.exists() {
-        return Err(format!(
-            "{} already exists; refusing to replace it.",
-            destination.display()
-        )
-        .into());
     }
     let parent = destination
         .parent()
@@ -100,7 +127,7 @@ fn create_default_settings() -> Result<(), Box<dyn Error>> {
         .open(path)
     {
         Ok(mut file) => {
-            file.write_all(b"enabled=false\nlayout=xbox\n")?;
+            file.write_all(b"version=2\n")?;
             file.sync_all()?;
             Ok(())
         }
@@ -122,6 +149,27 @@ fn write_new_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), Box<dyn
         .map_err(|error| format!("Cannot create {}: {error}", path.display()))?;
     file.write_all(contents)?;
     file.sync_all()?;
+    Ok(())
+}
+
+fn replace_file(path: &Path, contents: &[u8], mode: u32) -> Result<(), Box<dyn Error>> {
+    let parent = path
+        .parent()
+        .ok_or("Configuration path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".switch-swap-update-{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&temporary)
+        .map_err(|error| format!("Cannot prepare {}: {error}", path.display()))?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("Cannot update {}: {error}", path.display()))?;
     Ok(())
 }
 

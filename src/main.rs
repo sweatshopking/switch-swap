@@ -28,16 +28,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("apply") => {
             let layout = args.next().ok_or("Usage: switch-swap apply xbox|switch")?;
+            let controller = args
+                .next()
+                .ok_or("Usage: switch-swap apply xbox|switch <controller-id>")?;
             if args.next().is_some() {
-                return Err("Usage: switch-swap apply xbox|switch".into());
+                return Err("Usage: switch-swap apply xbox|switch <controller-id>".into());
             }
-            control(&format!("APPLY {layout}"))
+            control(&format!("APPLY {layout} {controller}"))
         }
         Some("disable") => {
+            let controller = args
+                .next()
+                .ok_or("Usage: switch-swap disable <controller-id>")?;
             if args.next().is_some() {
-                return Err("Usage: switch-swap disable".into());
+                return Err("Usage: switch-swap disable <controller-id>".into());
             }
-            control("DISABLE")
+            control(&format!("DISABLE {controller}"))
         }
         Some("--version") | Some("-V") => {
             println!("switch-swap {}", env!("CARGO_PKG_VERSION"));

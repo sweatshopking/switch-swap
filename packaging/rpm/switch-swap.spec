@@ -10,8 +10,8 @@ Requires:       systemd
 
 %description
 Switch Swap is a GTK application and system service that detects up to four
-Linux evdev game controllers and swaps the face-button positions between Xbox
-and Nintendo Switch layouts.
+Linux evdev game controllers and lets you remap each controller individually
+between Xbox and Nintendo Switch face-button layouts.
 
 %prep
 
@@ -20,13 +20,20 @@ and Nintendo Switch layouts.
 %install
 install -Dpm0755 %{_sourcedir}/switch-swap %{buildroot}%{_bindir}/switch-swap
 install -Dpm0644 %{_sourcedir}/switch-swap.service %{buildroot}/usr/lib/systemd/system/switch-swap.service
+install -Dpm0644 %{_sourcedir}/10-controller-device-access.conf %{buildroot}/usr/lib/systemd/system/switch-swap.service.d/10-controller-device-access.conf
 install -Dpm0644 %{_sourcedir}/settings.conf %{buildroot}%{_sysconfdir}/switch-swap/settings.conf
 install -Dpm0644 %{_sourcedir}/switch-swap.desktop %{buildroot}%{_datadir}/applications/switch-swap.desktop
 install -Dpm0644 %{_sourcedir}/io.github.switchswap.SwitchSwap.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.switchswap.SwitchSwap.svg
+install -Dpm0644 %{_sourcedir}/io.github.switchswap.SwitchSwap-symbolic.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.switchswap.SwitchSwap-symbolic.svg
+install -Dpm0644 %{_sourcedir}/switch-swap-logo.svg %{buildroot}%{_datadir}/switch-swap/switch-swap-logo.svg
 
 %post
 systemctl daemon-reload
-systemctl enable --now switch-swap.service
+if [ "$1" -gt 1 ] && systemctl is-active --quiet switch-swap.service; then
+    systemctl restart switch-swap.service
+else
+    systemctl enable --now switch-swap.service
+fi
 
 %preun
 if [ "$1" -eq 0 ]; then
@@ -39,6 +46,9 @@ systemctl daemon-reload
 %files
 %{_bindir}/switch-swap
 /usr/lib/systemd/system/switch-swap.service
+/usr/lib/systemd/system/switch-swap.service.d/10-controller-device-access.conf
 %config(noreplace) %{_sysconfdir}/switch-swap/settings.conf
 %{_datadir}/applications/switch-swap.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.github.switchswap.SwitchSwap.svg
+%{_datadir}/icons/hicolor/scalable/apps/io.github.switchswap.SwitchSwap-symbolic.svg
+%{_datadir}/switch-swap/switch-swap-logo.svg

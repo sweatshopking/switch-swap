@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to package (for example v0.1.0)
+        description: Existing version tag to package (for example v0.1.1)
         required: true
         type: string
 
@@ -83,6 +83,10 @@ jobs:
         run: |
           dpkg-deb --info "dist/switch-swap_${{ steps.version.outputs.version }}_amd64.deb"
           rpm -qip "dist/switch-swap-${{ steps.version.outputs.version }}-1.x86_64.rpm"
+          dpkg-deb --contents "dist/switch-swap_${{ steps.version.outputs.version }}_amd64.deb" |
+            grep -q '10-controller-device-access.conf'
+          rpm -qlp "dist/switch-swap-${{ steps.version.outputs.version }}-1.x86_64.rpm" |
+            grep -q 'io.github.switchswap.SwitchSwap-symbolic.svg'
           file dist/*.AppImage
           (cd dist && sha256sum --check SHA256SUMS)
           APPIMAGE_EXTRACT_AND_RUN=1 \

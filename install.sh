@@ -19,11 +19,11 @@ install -Dm644 "${project_dir}/systemd/switch-swap.service" \
 install -d -m755 /etc/switch-swap
 if [[ ! -e /etc/switch-swap/settings.conf ]]; then
     install -m600 /dev/null /etc/switch-swap/settings.conf
-    printf 'enabled=false\nlayout=xbox\n' > /etc/switch-swap/settings.conf
+    printf 'version=2\n' > /etc/switch-swap/settings.conf
 fi
 install -d -m755 /run/switch-swap
 systemctl daemon-reload
 systemctl enable --now switch-swap.service
 
 echo "Installed. Launch switch-swap as a regular user."
-echo "Apply/undo prompts for administrator authorization through polkit."
+echo "Select a controller before applying or undoing its layout; polkit authorization is required."

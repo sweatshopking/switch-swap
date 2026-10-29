@@ -23,7 +23,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX
 DevicePolicy=closed
-DeviceAllow=/dev/input/event* rw
+DeviceAllow=char-input rw
 DeviceAllow=/dev/uinput rw
 
 [Install]
