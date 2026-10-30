@@ -1,12 +1,14 @@
 #!/bin/sh
 set -e
-systemctl daemon-reload
-deb-systemd-invoke enable switch-swap.service
+# Not in a running system (an image build or container): nothing to start.
+[ -d /run/systemd/system ] || exit 0
+systemctl daemon-reload || true
 if [ "$1" = configure ]; then
+    systemctl enable switch-swap.service || true
     if [ -n "${2:-}" ] && systemctl is-active --quiet switch-swap.service; then
-        deb-systemd-invoke restart switch-swap.service
+        systemctl restart switch-swap.service || true
     else
-        deb-systemd-invoke start switch-swap.service
+        systemctl start switch-swap.service || true
     fi
 fi
 exit 0

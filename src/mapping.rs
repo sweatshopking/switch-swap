@@ -24,8 +24,8 @@ impl Layout {
     }
 }
 
-pub fn map_event(event: InputEvent, layout: Layout) -> InputEvent {
-    if layout != Layout::Switch || event.event_type() != EventType::KEY {
+pub fn map_event(event: InputEvent, source: Layout, target: Layout) -> InputEvent {
+    if source == target || event.event_type() != EventType::KEY {
         return event;
     }
 
@@ -46,7 +46,7 @@ mod tests {
     use evdev::AbsoluteAxisCode;
 
     #[test]
-    fn xbox_layout_leaves_face_buttons_unchanged() {
+    fn same_layout_leaves_face_buttons_unchanged() {
         for key in [
             KeyCode::BTN_SOUTH,
             KeyCode::BTN_EAST,
@@ -54,12 +54,12 @@ mod tests {
             KeyCode::BTN_NORTH,
         ] {
             let event = *evdev::KeyEvent::new(key, 1);
-            assert_eq!(map_event(event, Layout::Xbox).code(), key.0);
+            assert_eq!(map_event(event, Layout::Xbox, Layout::Xbox).code(), key.0);
         }
     }
 
     #[test]
-    fn switch_layout_swaps_all_four_face_button_positions() {
+    fn conversions_in_either_direction_swap_all_four_face_button_positions() {
         let pairs = [
             (KeyCode::BTN_SOUTH, KeyCode::BTN_EAST),
             (KeyCode::BTN_EAST, KeyCode::BTN_SOUTH),
@@ -70,10 +70,15 @@ mod tests {
         for (input, output) in pairs {
             for value in [0, 1, 2] {
                 let event = *evdev::KeyEvent::new(input, value);
-                let mapped = map_event(event, Layout::Switch);
-                assert_eq!(mapped.event_type(), EventType::KEY);
-                assert_eq!(mapped.code(), output.0);
-                assert_eq!(mapped.value(), value);
+                for (source, target) in [
+                    (Layout::Xbox, Layout::Switch),
+                    (Layout::Switch, Layout::Xbox),
+                ] {
+                    let mapped = map_event(event, source, target);
+                    assert_eq!(mapped.event_type(), EventType::KEY);
+                    assert_eq!(mapped.code(), output.0);
+                    assert_eq!(mapped.value(), value);
+                }
             }
         }
     }
@@ -83,8 +88,8 @@ mod tests {
         let key = *evdev::KeyEvent::new(KeyCode::BTN_START, 1);
         let axis = *evdev::AbsoluteAxisEvent::new(AbsoluteAxisCode::ABS_X, -123);
 
-        assert_eq!(map_event(key, Layout::Switch), key);
-        assert_eq!(map_event(axis, Layout::Switch), axis);
+        assert_eq!(map_event(key, Layout::Xbox, Layout::Switch), key);
+        assert_eq!(map_event(axis, Layout::Xbox, Layout::Switch), axis);
     }
 
     #[test]

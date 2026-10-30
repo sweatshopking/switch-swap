@@ -1,7 +1,11 @@
 mod daemon;
 mod gui;
+mod identity;
 mod installer;
 mod mapping;
+mod report;
+mod update;
+mod virtual_pad;
 
 use std::error::Error;
 use std::os::unix::net::UnixStream;
@@ -20,6 +24,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("service") => daemon::run(),
+        Some("restore-isolation") => daemon::restore_isolation(),
         Some("install-service") => {
             if args.next().is_some() {
                 return Err("Usage: switch-swap install-service".into());
@@ -27,14 +32,22 @@ fn run() -> Result<(), Box<dyn Error>> {
             installer::install_service()
         }
         Some("apply") => {
-            let layout = args.next().ok_or("Usage: switch-swap apply xbox|switch")?;
-            let controller = args
-                .next()
-                .ok_or("Usage: switch-swap apply xbox|switch <controller-id>")?;
+            let source = args.next().ok_or(
+                "Usage: switch-swap apply <source-layout> <target-layout> <controller-id>",
+            )?;
+            let target = args.next().ok_or(
+                "Usage: switch-swap apply <source-layout> <target-layout> <controller-id>",
+            )?;
+            let controller = args.next().ok_or(
+                "Usage: switch-swap apply <source-layout> <target-layout> <controller-id>",
+            )?;
             if args.next().is_some() {
-                return Err("Usage: switch-swap apply xbox|switch <controller-id>".into());
+                return Err(
+                    "Usage: switch-swap apply <source-layout> <target-layout> <controller-id>"
+                        .into(),
+                );
             }
-            control(&format!("APPLY {layout} {controller}"))
+            control(&format!("APPLY {source} {target} {controller}"))
         }
         Some("disable") => {
             let controller = args
@@ -44,6 +57,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 return Err("Usage: switch-swap disable <controller-id>".into());
             }
             control(&format!("DISABLE {controller}"))
+        }
+        Some("report") => {
+            print!("{}", report::generate());
+            Ok(())
         }
         Some("--version") | Some("-V") => {
             println!("switch-swap {}", env!("CARGO_PKG_VERSION"));

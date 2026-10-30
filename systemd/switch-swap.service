@@ -5,6 +5,7 @@ After=systemd-udevd.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/switch-swap service
+ExecStopPost=/usr/bin/switch-swap restore-isolation
 User=root
 Group=root
 RuntimeDirectory=switch-swap
@@ -14,7 +15,7 @@ RestartSec=2
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/etc/switch-swap /run/switch-swap
+ReadWritePaths=/etc/switch-swap /etc/udev/rules.d /run/switch-swap
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

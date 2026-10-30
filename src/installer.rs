@@ -7,10 +7,20 @@ use std::process::Command;
 
 const SERVICE_UNIT_PATH: &str = "/etc/systemd/system/switch-swap.service";
 const SETTINGS_PATH: &str = "/etc/switch-swap/settings.conf";
-const APPIMAGE_PATH: &str = "/opt/switch-swap/switch-swap.AppImage";
+/// Where the AppImage is copied for the service. /opt first; /var/lib on
+/// systems whose /opt is read-only (SteamOS). Both survive system updates.
+const APPIMAGE_PATHS: [&str; 2] = [
+    "/opt/switch-swap/switch-swap.AppImage",
+    "/var/lib/switch-swap/switch-swap.AppImage",
+];
 const DEVICE_ACCESS_DROPIN_PATH: &str =
     "/etc/systemd/system/switch-swap.service.d/10-controller-device-access.conf";
 const SERVICE_UNIT: &str = include_str!("../systemd/switch-swap.service");
+const APP_ID: &str = "io.github.switchswap.SwitchSwap";
+const DESKTOP_ENTRY: &str = include_str!("../packaging/io.github.switchswap.SwitchSwap.desktop");
+const ICON: &[u8] = include_bytes!("../packaging/io.github.switchswap.SwitchSwap.svg");
+const SYMBOLIC_ICON: &[u8] =
+    include_bytes!("../packaging/io.github.switchswap.SwitchSwap-symbolic.svg");
 const DEVICE_ACCESS_DROPIN: &str =
     include_str!("../systemd/switch-swap.service.d/10-controller-device-access.conf");
 
@@ -25,13 +35,17 @@ pub fn install_service() -> Result<(), Box<dyn Error>> {
         .map(PathBuf::from)
         .filter(|path| path.is_file());
     let (binary_source, binary_destination, service_unit) = if let Some(appimage) = appimage {
+        let destination = APPIMAGE_PATHS
+            .iter()
+            .map(Path::new)
+            .find(|path| path.parent().is_some_and(writable_dir))
+            .ok_or(
+                "Neither /opt nor /var/lib can be written to, so the service cannot be installed.",
+            )?;
         (
             appimage,
-            PathBuf::from(APPIMAGE_PATH),
-            SERVICE_UNIT.replace(
-                "/usr/bin/switch-swap",
-                "/opt/switch-swap/switch-swap.AppImage",
-            ),
+            destination.to_path_buf(),
+            appimage_unit(SERVICE_UNIT, destination),
         )
     } else {
         (
@@ -50,8 +64,11 @@ pub fn install_service() -> Result<(), Box<dyn Error>> {
         };
         let existing_unit = fs::read_to_string(unit_path)
             .map_err(|error| format!("Cannot read {}: {error}", unit_path.display()))?;
-        let destination = if existing_unit.contains(APPIMAGE_PATH) {
-            PathBuf::from(APPIMAGE_PATH)
+        let destination = if let Some(path) = APPIMAGE_PATHS
+            .iter()
+            .find(|path| existing_unit.contains(**path))
+        {
+            PathBuf::from(path)
         } else if existing_unit.contains("/usr/bin/switch-swap") {
             PathBuf::from("/usr/bin/switch-swap")
         } else {
@@ -62,10 +79,24 @@ pub fn install_service() -> Result<(), Box<dyn Error>> {
             .into());
         };
         install_executable(&binary_source, &destination)?;
+        install_menu_entry_if_possible(&destination);
         create_default_settings()?;
+        let mut dropin = DEVICE_ACCESS_DROPIN.replace(
+            "/usr/bin/switch-swap",
+            destination
+                .to_str()
+                .ok_or("Invalid application install path")?,
+        );
+        if is_appimage_install(&destination) {
+            // Installs from 0.1.x lack this; see appimage_unit.
+            dropin = dropin.replace(
+                "[Service]\n",
+                "[Service]\nEnvironment=APPIMAGE_EXTRACT_AND_RUN=1\n",
+            );
+        }
         replace_file(
             Path::new(DEVICE_ACCESS_DROPIN_PATH),
-            DEVICE_ACCESS_DROPIN.as_bytes(),
+            dropin.as_bytes(),
             0o644,
         )?;
         systemctl(&["daemon-reload"])?;
@@ -76,12 +107,24 @@ pub fn install_service() -> Result<(), Box<dyn Error>> {
     }
 
     install_executable(&binary_source, &binary_destination)?;
+    install_menu_entry_if_possible(&binary_destination);
     create_default_settings()?;
     write_new_file(Path::new(SERVICE_UNIT_PATH), service_unit.as_bytes(), 0o644)?;
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", "switch-swap.service"])?;
     println!("Switch Swap system service installed and enabled.");
     Ok(())
+}
+
+/// The service unit for an AppImage install. The service's sandbox has no
+/// FUSE (DevicePolicy=closed, NoNewPrivileges), so the AppImage unpacks itself
+/// into the service's private /tmp instead of mounting.
+fn appimage_unit(unit: &str, destination: &Path) -> String {
+    unit.replace("/usr/bin/switch-swap", &destination.to_string_lossy())
+        .replace(
+            "[Service]\n",
+            "[Service]\nEnvironment=APPIMAGE_EXTRACT_AND_RUN=1\n",
+        )
 }
 
 fn install_executable(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
@@ -114,6 +157,58 @@ fn install_executable(source: &Path, destination: &Path) -> Result<(), Box<dyn E
     Ok(())
 }
 
+fn is_appimage_install(path: &Path) -> bool {
+    APPIMAGE_PATHS
+        .iter()
+        .any(|candidate| Path::new(candidate) == path)
+}
+
+/// Whether files can be created in `dir` (creating it if needed). False on
+/// read-only system folders, such as /opt on SteamOS.
+fn writable_dir(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".switch-swap-write-test-{}", std::process::id()));
+    let writable = File::create(&probe).is_ok();
+    let _ = fs::remove_file(probe);
+    writable
+}
+
+/// The menu entry is a convenience: where /usr/local is read-only (SteamOS)
+/// the service is still installed and the AppImage can be opened directly.
+fn install_menu_entry_if_possible(executable: &Path) {
+    if let Err(error) = install_desktop_entry(executable) {
+        eprintln!("Switch Swap was installed, but its menu entry could not be added: {error}");
+    }
+}
+
+/// Adds the menu entry and icons unless a distribution package already did.
+/// The entry is named after the GTK application id so the desktop can match
+/// the running window to its icon.
+fn install_desktop_entry(executable: &Path) -> Result<(), Box<dyn Error>> {
+    if Path::new(&format!("/usr/share/applications/{APP_ID}.desktop")).exists() {
+        return Ok(());
+    }
+    let executable = executable
+        .to_str()
+        .ok_or("Invalid application install path")?;
+    let entry = DESKTOP_ENTRY.replace("Exec=switch-swap", &format!("Exec={executable}"));
+    replace_file(
+        Path::new(&format!("/usr/local/share/applications/{APP_ID}.desktop")),
+        entry.as_bytes(),
+        0o644,
+    )?;
+    let icons = Path::new("/usr/local/share/icons/hicolor/scalable/apps");
+    replace_file(&icons.join(format!("{APP_ID}.svg")), ICON, 0o644)?;
+    replace_file(
+        &icons.join(format!("{APP_ID}-symbolic.svg")),
+        SYMBOLIC_ICON,
+        0o644,
+    )?;
+    Ok(())
+}
+
 fn create_default_settings() -> Result<(), Box<dyn Error>> {
     let path = Path::new(SETTINGS_PATH);
     fs::create_dir_all(
@@ -127,7 +222,7 @@ fn create_default_settings() -> Result<(), Box<dyn Error>> {
         .open(path)
     {
         Ok(mut file) => {
-            file.write_all(b"version=2\n")?;
+            file.write_all(b"version=4\n")?;
             file.sync_all()?;
             Ok(())
         }
@@ -189,4 +284,19 @@ fn systemctl(arguments: &[&str]) -> Result<(), Box<dyn Error>> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appimage_service_runs_without_fuse() {
+        let unit = appimage_unit(SERVICE_UNIT, Path::new(APPIMAGE_PATHS[1]));
+        assert!(unit.contains("[Service]\nEnvironment=APPIMAGE_EXTRACT_AND_RUN=1\n"));
+        assert!(unit.contains("ExecStart=/var/lib/switch-swap/switch-swap.AppImage service"));
+        assert!(is_appimage_install(Path::new(APPIMAGE_PATHS[0])));
+        assert!(!is_appimage_install(Path::new("/usr/bin/switch-swap")));
+        assert!(!unit.contains("/usr/bin/switch-swap"));
+    }
 }

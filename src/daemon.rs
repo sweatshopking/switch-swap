@@ -1,9 +1,8 @@
+use crate::identity;
 use crate::mapping::{Layout, map_event};
-use evdev::{
-    AbsoluteAxisCode, AttributeSet, Device, EventType, KeyCode, UinputAbsSetup,
-    uinput::VirtualDevice,
-};
-use std::collections::{HashMap, HashSet};
+use crate::virtual_pad::VirtualPad;
+use evdev::{AbsoluteAxisCode, Device, KeyCode};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -11,6 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -19,6 +19,16 @@ const SOCKET_DIR: &str = "/run/switch-swap";
 const SOCKET_PATH: &str = "/run/switch-swap/control.sock";
 const SETTINGS_DIR: &str = "/etc/switch-swap";
 const SETTINGS_PATH: &str = "/etc/switch-swap/settings.conf";
+/// After every rule that grants controller access (steam-devices at 60,
+/// systemd's 70-uaccess, game-devices-udev's 71-*) and before 73-seat-late,
+/// which turns the uaccess tag into the user's access.
+const ISOLATION_RULE_PATH: &str = "/etc/udev/rules.d/72-switch-swap-isolation.rules";
+/// Where Switch Swap 0.1.x kept its rules.
+const LEGACY_ISOLATION_RULE_PATH: &str = "/etc/udev/rules.d/69-switch-swap-isolation.rules";
+/// Set while udev may not have applied the rule file on disk (a reload failed).
+static UDEV_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const ISOLATION_RULE_HEADER: &str =
+    "# Managed by Switch Swap; do not edit while controller isolation is enabled.\n";
 const MAX_CONTROLLERS: usize = 4;
 
 #[derive(Clone, Default)]
@@ -30,7 +40,11 @@ struct Settings {
 #[derive(Clone)]
 struct ControllerProfile {
     name: String,
-    layout: Layout,
+    source_layout: Layout,
+    target_layout: Layout,
+    /// HID-level matches learned from the connected controller (see
+    /// [`identity::hidraw_match`]), so its hidraw node is hidden at plug time.
+    hidraw: BTreeSet<String>,
 }
 
 #[derive(Clone, Default)]
@@ -53,6 +67,8 @@ struct ServiceStatus {
 struct DiscoveredController {
     path: PathBuf,
     id: String,
+    legacy_id: String,
+    hidraw: Option<String>,
     name: String,
 }
 
@@ -71,7 +87,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Err("The system service must run as root. Start it with systemd; do not run the GUI as root.".into());
     }
 
-    let settings = read_settings()?;
+    let mut settings = read_settings()?;
+    let profile_count = settings.profiles.len();
+    settings
+        .profiles
+        .retain(|_, profile| !identity::is_legacy_virtual_name(&profile.name));
+    if settings.profiles.len() != profile_count {
+        save_settings(&settings)?;
+        eprintln!("Removed saved profiles that targeted Switch Swap virtual controllers.");
+    }
+    refresh_isolation_rules(&settings, None)?;
     fs::create_dir_all(SOCKET_DIR)?;
     if Path::new(SOCKET_PATH).exists() {
         let metadata = fs::symlink_metadata(SOCKET_PATH)?;
@@ -92,13 +117,23 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let status = Arc::new(Mutex::new(ServiceStatus::default()));
     let (disconnected_tx, disconnected_rx) = mpsc::channel::<String>();
     let mut workers = HashSet::<String>::new();
+    // Profile updates that failed, by "path|id", so they are not retried twice a second.
+    let mut update_failures = HashSet::<String>::new();
+    // Controllers already reported as impossible to hide, so they are logged once.
+    let mut unsafe_logged = HashSet::<String>::new();
     let mut last_scan_error = None;
 
     loop {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if let Err(error) = handle_client(stream, &settings, &status) {
+                    // A window closing while it waits for an answer is not a problem.
+                    if let Err(error) = handle_client(stream, &settings, &status)
+                        && error
+                            .downcast_ref::<std::io::Error>()
+                            .map(std::io::Error::kind)
+                            != Some(std::io::ErrorKind::BrokenPipe)
+                    {
                         eprintln!("control request failed: {error}");
                     }
                 }
@@ -144,10 +179,52 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             .errors
                             .remove(&controller.path.to_string_lossy().into_owned());
                     }
+                    current.errors.retain(|path, _| Path::new(path).exists());
+                    // Devices without a worker (those that cannot be hidden) get no
+                    // disconnect message; drop them once they are gone.
+                    current
+                        .devices
+                        .retain(|path, _| workers.contains(path) || Path::new(path).exists());
                 }
+                update_failures.retain(|key| {
+                    key.split_once('|')
+                        .is_some_and(|(path, _)| Path::new(path).exists())
+                });
+                unsafe_logged.retain(|path| Path::new(path).exists());
 
                 for controller in discovery.controllers {
-                    let DiscoveredController { path, id, name } = controller;
+                    // Workers lock the settings on every loop, so the slow work
+                    // (writing files, running udevadm) happens without the lock.
+                    // The control socket is served on this thread too, so nothing
+                    // else changes the settings meanwhile.
+                    let failure_key = format!("{}|{}", controller.path.display(), controller.id);
+                    let current = settings
+                        .lock()
+                        .map_err(|_| "Service settings lock is poisoned")?
+                        .clone();
+                    let mut updated = current.clone();
+                    if !update_failures.contains(&failure_key)
+                        && update_connected_profile(&mut updated, &controller)
+                    {
+                        match save_settings(&updated)
+                            .and_then(|()| refresh_isolation_rules(&updated, Some(&current)))
+                        {
+                            Ok(()) => {
+                                *settings
+                                    .lock()
+                                    .map_err(|_| "Service settings lock is poisoned")? = updated;
+                            }
+                            Err(error) => {
+                                // Not retried until the controller reconnects.
+                                eprintln!(
+                                    "Cannot update the saved profile for {}: {error}",
+                                    controller.name
+                                );
+                                update_failures.insert(failure_key);
+                            }
+                        }
+                    }
+                    let DiscoveredController { path, id, name, .. } = controller;
                     let path_key = path.to_string_lossy().into_owned();
                     if workers.contains(&path_key) {
                         continue;
@@ -159,6 +236,34 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             ));
                         }
                         break;
+                    }
+
+                    let settings_snapshot = settings
+                        .lock()
+                        .map_err(|_| "Service settings lock is poisoned")?
+                        .clone();
+                    let profile_requires_isolation = settings_snapshot.profiles.contains_key(&id);
+                    if profile_requires_isolation
+                        && !profile_has_safe_isolation(&settings_snapshot, &id)
+                    {
+                        let error =
+                            "Cannot safely hide this controller: its identity is not stable or is shared with another saved controller."
+                                .to_owned();
+                        if let Ok(mut current) = status.lock() {
+                            current.devices.insert(
+                                path_key.clone(),
+                                DeviceStatus {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    active: false,
+                                    error: Some(error.clone()),
+                                },
+                            );
+                        }
+                        if unsafe_logged.insert(path_key.clone()) {
+                            eprintln!("controller {path_key}: {error}");
+                        }
+                        continue;
                     }
 
                     workers.insert(path_key.clone());
@@ -181,7 +286,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     let disconnected = disconnected_tx.clone();
                     let worker_path_key = path_key.clone();
                     thread::spawn(move || {
-                        controller_worker(path, worker_path_key, id, name, settings, status);
+                        controller_worker(path, worker_path_key, id, settings, status);
                         let _ = disconnected.send(path_key);
                     });
                 }
@@ -209,6 +314,41 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 }
 
+pub fn restore_isolation() -> Result<(), Box<dyn Error>> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("Restoring controller access requires administrator authorization.".into());
+    }
+    let mut removed = false;
+    for path in [ISOLATION_RULE_PATH, LEGACY_ISOLATION_RULE_PATH] {
+        removed |= remove_managed_rule_file(Path::new(path))?;
+    }
+    if removed {
+        reconcile_udev(None)?;
+    }
+    Ok(())
+}
+
+/// Removes a Switch Swap rule file; refuses one it did not write.
+fn remove_managed_rule_file(rule_path: &Path) -> Result<bool, Box<dyn Error>> {
+    let contents = match fs::read_to_string(rule_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!("Cannot read {}: {error}", rule_path.display()).into());
+        }
+    };
+    if !contents.starts_with(ISOLATION_RULE_HEADER) {
+        return Err(format!(
+            "Refusing to remove {} because it is not managed by Switch Swap.",
+            rule_path.display()
+        )
+        .into());
+    }
+    fs::remove_file(rule_path)
+        .map_err(|error| format!("Cannot remove {}: {error}", rule_path.display()))?;
+    Ok(true)
+}
+
 fn read_settings() -> Result<Settings, Box<dyn Error>> {
     let contents = match fs::read_to_string(SETTINGS_PATH) {
         Ok(contents) => contents,
@@ -223,6 +363,7 @@ fn read_settings() -> Result<Settings, Box<dyn Error>> {
 
 fn parse_settings(contents: &str) -> Result<Settings, Box<dyn Error>> {
     let mut settings = Settings::default();
+    let mut hidraw_lines = Vec::new();
     for (line_number, line) in contents.lines().enumerate() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(format!("Invalid settings at line {}", line_number + 1).into());
@@ -248,30 +389,60 @@ fn parse_settings(contents: &str) -> Result<Settings, Box<dyn Error>> {
                     )
                 })?;
             }
-            "version" if value.trim() == "2" => {}
+            "version" if matches!(value.trim(), "2" | "3" | "4") => {}
+            "hidraw" => {
+                let (id, matcher) = value
+                    .split_once('|')
+                    .ok_or_else(|| format!("Invalid hidraw match at line {}", line_number + 1))?;
+                hidraw_lines.push((id.to_owned(), matcher.to_owned()));
+            }
             "device" => {
-                let fields = value.splitn(3, '|').collect::<Vec<_>>();
-                if fields.len() != 3 || !valid_device_id(fields[0]) {
+                let fields = value.splitn(4, '|').collect::<Vec<_>>();
+                if !matches!(fields.len(), 3 | 4) || !valid_device_id(fields[0]) {
                     return Err(
                         format!("Invalid controller profile at line {}", line_number + 1).into(),
                     );
                 }
-                let layout = Layout::parse(fields[1]).ok_or_else(|| {
+                let first_layout = Layout::parse(fields[1]).ok_or_else(|| {
                     format!(
                         "Unsupported layout at line {}: {}",
                         line_number + 1,
                         fields[1]
                     )
                 })?;
+                let (source_layout, target_layout, name) = if fields.len() == 3 {
+                    let source_layout = if first_layout == Layout::Switch {
+                        Layout::Xbox
+                    } else {
+                        first_layout
+                    };
+                    (source_layout, first_layout, fields[2])
+                } else {
+                    let target_layout = Layout::parse(fields[2]).ok_or_else(|| {
+                        format!(
+                            "Unsupported layout at line {}: {}",
+                            line_number + 1,
+                            fields[2]
+                        )
+                    })?;
+                    (first_layout, target_layout, fields[3])
+                };
                 settings.profiles.insert(
                     fields[0].to_owned(),
                     ControllerProfile {
-                        name: fields[2].to_owned(),
-                        layout,
+                        name: name.to_owned(),
+                        source_layout,
+                        target_layout,
+                        hidraw: BTreeSet::new(),
                     },
                 );
             }
             _ => return Err(format!("Unknown setting at line {}", line_number + 1).into()),
+        }
+    }
+    for (id, matcher) in hidraw_lines {
+        if let Some(profile) = settings.profiles.get_mut(&id) {
+            profile.hidraw.insert(matcher);
         }
     }
     Ok(settings)
@@ -282,17 +453,228 @@ fn save_settings(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let temporary_path = format!("{SETTINGS_PATH}.tmp");
     let mut profiles = settings.profiles.iter().collect::<Vec<_>>();
     profiles.sort_by(|left, right| left.0.cmp(right.0));
-    let mut contents = String::from("version=2\n");
+    let mut contents = String::from("version=4\n");
     for (id, profile) in profiles {
         contents.push_str(&format!(
-            "device={}|{}|{}\n",
+            "device={}|{}|{}|{}\n",
             id,
-            profile.layout.as_str(),
+            profile.source_layout.as_str(),
+            profile.target_layout.as_str(),
             clean_field(&profile.name)
         ));
+        for matcher in &profile.hidraw {
+            contents.push_str(&format!("hidraw={id}|{}\n", clean_field(matcher)));
+        }
     }
     fs::write(&temporary_path, contents)?;
     fs::rename(temporary_path, SETTINGS_PATH)?;
+    Ok(())
+}
+
+fn profile_has_safe_isolation(settings: &Settings, id: &str) -> bool {
+    let Some(selector) = identity::selector_from_id(id) else {
+        return false;
+    };
+    !settings.profiles.keys().any(|other_id| {
+        other_id != id && identity::selector_from_id(other_id).as_ref() == Some(&selector)
+    })
+}
+
+fn render_isolation_rules(settings: &Settings) -> String {
+    let mut profiles = settings.profiles.iter().collect::<Vec<_>>();
+    profiles.sort_by(|left, right| left.0.cmp(right.0));
+    // Order matters: a hidraw IMPORT line must precede the lines that use it.
+    let mut rules = Vec::new();
+    for (id, profile) in profiles {
+        if !profile_has_safe_isolation(settings, id) {
+            continue;
+        }
+        if let Some(selector) = identity::selector_from_id(id) {
+            for line in identity::rule_lines(&selector, &profile.hidraw) {
+                if !rules.contains(&line) {
+                    rules.push(line);
+                }
+            }
+        }
+    }
+    if rules.is_empty() {
+        String::new()
+    } else {
+        format!("{ISOLATION_RULE_HEADER}{}\n", rules.join("\n"))
+    }
+}
+
+/// Writes the rule file for `settings` and has udev apply it. `previous` is the
+/// settings the current rules were made for, so only controllers that gain or
+/// lose a rule are re-examined; `None` re-examines every input device.
+fn refresh_isolation_rules(
+    settings: &Settings,
+    previous: Option<&Settings>,
+) -> Result<(), Box<dyn Error>> {
+    use std::sync::atomic::Ordering;
+
+    let desired = render_isolation_rules(settings);
+    let existing = match fs::read_to_string(ISOLATION_RULE_PATH) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!("Cannot read {ISOLATION_RULE_PATH}: {error}").into());
+        }
+    };
+    if existing
+        .as_ref()
+        .is_some_and(|contents| !contents.starts_with(ISOLATION_RULE_HEADER))
+    {
+        return Err(format!(
+            "Refusing to overwrite {} because it is not managed by Switch Swap.",
+            ISOLATION_RULE_PATH
+        )
+        .into());
+    }
+    let legacy_removed = remove_managed_rule_file(Path::new(LEGACY_ISOLATION_RULE_PATH))?;
+    let unchanged =
+        existing.as_deref() == Some(desired.as_str()) || (existing.is_none() && desired.is_empty());
+    let pending = UDEV_PENDING.load(Ordering::SeqCst);
+    if unchanged && !legacy_removed && !pending {
+        return Ok(());
+    }
+
+    if !unchanged {
+        let rule_path = Path::new(ISOLATION_RULE_PATH);
+        let parent = rule_path
+            .parent()
+            .ok_or("Isolation rule path has no parent directory")?;
+        fs::create_dir_all(parent)?;
+        if desired.is_empty() {
+            match fs::remove_file(rule_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("Cannot remove {}: {error}", rule_path.display()).into());
+                }
+            }
+        } else {
+            let temporary =
+                parent.join(format!(".switch-swap-isolation-{}.tmp", std::process::id()));
+            fs::write(&temporary, desired.as_bytes())
+                .map_err(|error| format!("Cannot write {}: {error}", temporary.display()))?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))?;
+            fs::rename(&temporary, rule_path)
+                .map_err(|error| format!("Cannot install {}: {error}", rule_path.display()))?;
+        }
+    }
+
+    UDEV_PENDING.store(true, Ordering::SeqCst);
+    // A failed earlier reload may have left any device out of date.
+    let scope = if pending || legacy_removed {
+        None
+    } else {
+        previous.and_then(|previous| affected_models(settings, previous))
+    };
+    reconcile_udev(scope.as_ref())?;
+    UDEV_PENDING.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+/// The vendor:product pairs whose rules differ between two settings; None when
+/// a 0.1.x profile is involved, whose rules are not tied to one model.
+fn affected_models(settings: &Settings, previous: &Settings) -> Option<BTreeSet<(u16, u16)>> {
+    let mut models = BTreeSet::new();
+    for id in settings.profiles.keys().chain(previous.profiles.keys()) {
+        match identity::selector_from_id(id) {
+            Some(identity::Selector::Key(key)) => {
+                models.insert((key.vendor, key.product));
+            }
+            Some(_) => return None,
+            None => {}
+        }
+    }
+    Some(models)
+}
+
+/// Reloads udev's rules and has it re-apply them: to the input and hidraw
+/// devices of `models`, or to every input and hidraw device when `None`.
+fn reconcile_udev(models: Option<&BTreeSet<(u16, u16)>>) -> Result<(), Box<dyn Error>> {
+    run_udevadm(&["control", "--reload"])?;
+    let Some(models) = models else {
+        run_udevadm(&["trigger", "--action=change", "--subsystem-match=input"])?;
+        run_udevadm(&["trigger", "--action=change", "--subsystem-match=hidraw"])?;
+        return Ok(());
+    };
+    let devices = model_devices(models);
+    if devices.is_empty() {
+        return Ok(());
+    }
+    let mut arguments = vec!["trigger".to_owned(), "--action=change".to_owned()];
+    arguments.extend(devices);
+    run_udevadm(&arguments.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// sysfs paths of the input and hidraw devices of the given models.
+fn model_devices(models: &BTreeSet<(u16, u16)>) -> Vec<String> {
+    let read_hex = |path: PathBuf| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|value| u16::from_str_radix(value.trim(), 16).ok())
+    };
+    let mut devices = Vec::new();
+    for entry in fs::read_dir("/sys/class/input")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        let id = path.join("device/id");
+        if let (Some(vendor), Some(product)) =
+            (read_hex(id.join("vendor")), read_hex(id.join("product")))
+            && models.contains(&(vendor, product))
+        {
+            devices.push(path.to_string_lossy().into_owned());
+        }
+    }
+    for entry in fs::read_dir("/sys/class/hidraw")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        // HID_ID=0005:0000057E:00002009
+        let model = fs::read_to_string(path.join("device/uevent"))
+            .ok()
+            .and_then(|uevent| {
+                let id = uevent
+                    .lines()
+                    .find_map(|line| line.strip_prefix("HID_ID="))?;
+                let mut fields = id.split(':').skip(1);
+                let mut field = || {
+                    u32::from_str_radix(fields.next()?, 16)
+                        .ok()?
+                        .try_into()
+                        .ok()
+                };
+                Some((field()?, field()?))
+            });
+        if model.is_some_and(|model| models.contains(&model)) {
+            devices.push(path.to_string_lossy().into_owned());
+        }
+    }
+    devices
+}
+
+fn run_udevadm(arguments: &[&str]) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("udevadm")
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("Cannot run udevadm: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "udevadm {} failed ({}): {}",
+            arguments.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -315,15 +697,21 @@ fn handle_client(
             .to_owned()
     } else if let Some(arguments) = request.strip_prefix("APPLY ") {
         let fields = arguments.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 2 || !valid_device_id(fields[1]) {
-            "ERR Usage: APPLY xbox|switch <controller-id>.\n".to_owned()
-        } else if let Some(layout) = Layout::parse(fields[0]) {
-            match apply_profile(fields[1], layout, settings, status) {
-                Ok(name) => format!("OK {} layout saved for {name} only.\n", layout.as_str()),
+        if fields.len() != 3 || !valid_device_id(fields[2]) {
+            "ERR Usage: APPLY <source-layout> <target-layout> <controller-id>.\n".to_owned()
+        } else if let (Some(source), Some(target)) =
+            (Layout::parse(fields[0]), Layout::parse(fields[1]))
+        {
+            match apply_profile(fields[2], source, target, settings, status) {
+                Ok(name) => format!(
+                    "OK {} -> {} conversion saved for {name} only. Physical input isolation is active; restart games/Steam or reboot to close handles that were already open.\n",
+                    source.as_str(),
+                    target.as_str()
+                ),
                 Err(error) => format!("ERR {error}\n"),
             }
         } else {
-            "ERR Usage: APPLY xbox|switch <controller-id>.\n".to_owned()
+            "ERR Usage: APPLY <source-layout> <target-layout> <controller-id>.\n".to_owned()
         }
     } else if let Some(id) = request.strip_prefix("DISABLE ") {
         if !valid_device_id(id) {
@@ -335,7 +723,7 @@ fn handle_client(
             }
         }
     } else {
-        "ERR Unknown request. Use STATUS, APPLY xbox|switch <controller-id>, or DISABLE <controller-id>.\n"
+        "ERR Unknown request. Use STATUS, APPLY <source-layout> <target-layout> <controller-id>, or DISABLE <controller-id>.\n"
             .to_owned()
     };
 
@@ -345,47 +733,110 @@ fn handle_client(
 
 fn apply_profile(
     id: &str,
-    layout: Layout,
+    source_layout: Layout,
+    target_layout: Layout,
     settings: &Arc<Mutex<Settings>>,
     status: &Arc<Mutex<ServiceStatus>>,
 ) -> Result<String, String> {
-    let name = status
+    let (name, id, path) = status
         .lock()
         .map_err(|_| "Service status is unavailable".to_owned())?
         .devices
-        .values()
-        .find(|device| device.id == id)
-        .map(|device| device.name.clone())
+        .iter()
+        .find(|(_, device)| device.id == id)
+        .map(|(path, device)| (device.name.clone(), device.id.clone(), path.clone()))
         .ok_or_else(|| {
             "The selected controller is not currently connected or compatible.".to_owned()
         })?;
+    if identity::selector_from_id(&id).is_none() {
+        return Err(
+            "This controller's name contains characters that cannot be matched safely, so Switch Swap cannot hide it from games."
+                .to_owned(),
+        );
+    }
+    let hidraw = identity::hidraw_match(Path::new(&path));
 
-    let mut current = settings
+    let current = settings
         .lock()
-        .map_err(|_| "Service settings are unavailable".to_owned())?;
-    let updated = with_profile(&current, id, &name, layout);
+        .map_err(|_| "Service settings are unavailable".to_owned())?
+        .clone();
+    let updated = with_profile(&current, &id, &name, source_layout, target_layout, hidraw);
+    if !profile_has_safe_isolation(&updated, &id) {
+        return Err(
+            "This controller shares its isolation identity with another saved controller; refusing to hide both."
+                .to_owned(),
+        );
+    }
     save_settings(&updated).map_err(|error| format!("Cannot save persistent settings: {error}"))?;
-    *current = updated;
+    if let Err(error) = refresh_isolation_rules(&updated, Some(&current)) {
+        save_settings(&current).map_err(|rollback| {
+            format!("Isolation setup failed ({error}); cannot restore settings: {rollback}")
+        })?;
+        refresh_isolation_rules(&current, Some(&updated)).map_err(|rollback| {
+            format!("Isolation setup failed ({error}); cannot restore isolation rules: {rollback}")
+        })?;
+        return Err(format!("Cannot isolate the physical controller: {error}"));
+    }
+    *settings
+        .lock()
+        .map_err(|_| "Service settings are unavailable".to_owned())? = updated;
     Ok(name)
 }
 
-fn with_profile(settings: &Settings, id: &str, name: &str, layout: Layout) -> Settings {
+fn with_profile(
+    settings: &Settings,
+    id: &str,
+    name: &str,
+    source_layout: Layout,
+    target_layout: Layout,
+    hidraw: Option<String>,
+) -> Settings {
     let mut updated = settings.clone();
     updated.legacy_global_setting = false;
+    let mut learned = updated
+        .profiles
+        .get(id)
+        .map(|profile| profile.hidraw.clone())
+        .unwrap_or_default();
+    learned.extend(hidraw);
     updated.profiles.insert(
         id.to_owned(),
         ControllerProfile {
             name: name.to_owned(),
-            layout,
+            source_layout,
+            target_layout,
+            hidraw: learned,
         },
     );
     updated
 }
 
+/// Brings a connected controller's saved profile up to date: moves a profile
+/// saved under its 0.1.x identity to the current one and records how to match
+/// its hidraw node. Returns whether anything changed.
+fn update_connected_profile(settings: &mut Settings, controller: &DiscoveredController) -> bool {
+    let mut changed = false;
+    if !settings.profiles.contains_key(&controller.id)
+        && let Some(profile) = settings.profiles.remove(&controller.legacy_id)
+    {
+        settings.profiles.insert(controller.id.clone(), profile);
+        changed = true;
+    }
+    if let (Some(profile), Some(matcher)) = (
+        settings.profiles.get_mut(&controller.id),
+        controller.hidraw.as_ref(),
+    ) && profile.hidraw.insert(matcher.clone())
+    {
+        changed = true;
+    }
+    changed
+}
+
 fn disable_profile(id: &str, settings: &Arc<Mutex<Settings>>) -> Result<String, String> {
-    let mut current = settings
+    let current = settings
         .lock()
-        .map_err(|_| "Service settings are unavailable".to_owned())?;
+        .map_err(|_| "Service settings are unavailable".to_owned())?
+        .clone();
     let mut updated = current.clone();
     updated.legacy_global_setting = false;
     let profile = updated
@@ -393,7 +844,22 @@ fn disable_profile(id: &str, settings: &Arc<Mutex<Settings>>) -> Result<String, 
         .remove(id)
         .ok_or_else(|| "The selected controller has no saved remapping to undo.".to_owned())?;
     save_settings(&updated).map_err(|error| format!("Cannot save persistent settings: {error}"))?;
-    *current = updated;
+    if let Err(error) = refresh_isolation_rules(&updated, Some(&current)) {
+        save_settings(&current).map_err(|rollback| {
+            format!(
+                "Cannot release controller isolation ({error}); cannot restore settings: {rollback}"
+            )
+        })?;
+        refresh_isolation_rules(&current, Some(&updated)).map_err(|rollback| {
+            format!("Cannot release controller isolation ({error}); cannot restore isolation rules: {rollback}")
+        })?;
+        return Err(format!(
+            "Cannot release physical controller isolation: {error}"
+        ));
+    }
+    *settings
+        .lock()
+        .map_err(|_| "Service settings are unavailable".to_owned())? = updated;
     Ok(profile.name)
 }
 
@@ -423,7 +889,7 @@ fn make_status(settings: &Arc<Mutex<Settings>>, status: &Arc<Mutex<ServiceStatus
         return "ERR Service status is unavailable.\n".to_owned();
     };
 
-    let mut output = String::from("OK\nprotocol=3\n");
+    let mut output = String::from("OK\nprotocol=4\n");
     if let Some(message) = &status.message {
         output.push_str(&format!("message={}\n", clean_field(message)));
     }
@@ -433,6 +899,7 @@ fn make_status(settings: &Arc<Mutex<Settings>>, status: &Arc<Mutex<ServiceStatus
         );
     }
     output.push_str(&format!("repair_required={}\n", status.repair_required));
+    output.push_str(&format!("version={}\n", env!("CARGO_PKG_VERSION")));
     let mut devices = status.devices.values().collect::<Vec<_>>();
     devices.sort_by(|left, right| left.id.cmp(&right.id));
     for device in devices {
@@ -448,9 +915,10 @@ fn make_status(settings: &Arc<Mutex<Settings>>, status: &Arc<Mutex<ServiceStatus
     profiles.sort_by(|left, right| left.0.cmp(right.0));
     for (id, profile) in profiles {
         output.push_str(&format!(
-            "profile={}|{}|{}\n",
+            "profile={}|{}|{}|{}\n",
             id,
-            profile.layout.as_str(),
+            profile.source_layout.as_str(),
+            profile.target_layout.as_str(),
             clean_field(&profile.name)
         ));
     }
@@ -564,18 +1032,24 @@ fn discover_controllers() -> Result<Discovery, std::io::Error> {
                 continue;
             }
         };
+        if identity::is_virtual_device(&path)
+            || device.name().is_some_and(identity::is_legacy_virtual_name)
+        {
+            continue;
+        }
         let name = device.name().unwrap_or("Unnamed input device").to_owned();
         if discovery.names.len() < 5 {
             discovery.names.push(name.clone());
         }
         match controller_compatibility(&device) {
             ControllerCompatibility::Compatible => {
-                if !name.starts_with("Switch Swap - ") {
-                    let id = controller_identity(&path, &device);
-                    discovery
-                        .controllers
-                        .push(DiscoveredController { path, id, name });
-                }
+                discovery.controllers.push(DiscoveredController {
+                    id: identity::identify(&device).encode(),
+                    legacy_id: identity::legacy_identity(&path, &device),
+                    hidraw: identity::hidraw_match(&path),
+                    path,
+                    name,
+                });
             }
             ControllerCompatibility::Unsupported(reason) => {
                 discovery.candidates.push((
@@ -669,55 +1143,10 @@ fn controller_compatibility(device: &Device) -> ControllerCompatibility {
     }
 }
 
-fn controller_identity(path: &Path, device: &Device) -> String {
-    let by_id = fs::read_dir("/dev/input/by-id")
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let target = fs::canonicalize(entry.path()).ok()?;
-            let current = fs::canonicalize(path).ok()?;
-            (target == current).then(|| entry.file_name().to_string_lossy().into_owned())
-        })
-        .min_by_key(|name| {
-            let priority = if name.contains("event-joystick") || name.contains("event-gamepad") {
-                0
-            } else {
-                1
-            };
-            (priority, name.clone())
-        });
-    let (identity_kind, identity_value) = if let Some(by_id) = by_id {
-        ("by-id", by_id)
-    } else if let Some(unique) = device.unique_name().filter(|value| !value.is_empty()) {
-        ("unique", unique.to_owned())
-    } else if let Some(physical) = device.physical_path().filter(|value| !value.is_empty()) {
-        ("physical", physical.to_owned())
-    } else {
-        (
-            "event",
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-        )
-    };
-    let raw = format!(
-        "{:?}|{}|{}|{}",
-        device.input_id(),
-        device.name().unwrap_or_default(),
-        identity_kind,
-        identity_value
-    );
-    raw.bytes().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn controller_worker(
     path: PathBuf,
     path_key: String,
     device_id: String,
-    name: String,
     settings: Arc<Mutex<Settings>>,
     status: Arc<Mutex<ServiceStatus>>,
 ) {
@@ -743,12 +1172,13 @@ fn controller_worker(
 
     let mut virtual_device = None;
     let mut grabbed = false;
+    let mut virtual_target = None;
     loop {
-        let current_layout = match settings.lock() {
+        let current_conversion = match settings.lock() {
             Ok(settings) => settings
                 .profiles
                 .get(&device_id)
-                .map(|profile| profile.layout),
+                .map(|profile| (profile.source_layout, profile.target_layout)),
             Err(_) => {
                 set_device_error(
                     &status,
@@ -759,8 +1189,28 @@ fn controller_worker(
             }
         };
 
-        if current_layout.is_some() && !grabbed {
-            match create_virtual_device(&device, &name) {
+        let target = current_conversion.map(|(_, target)| target);
+        if grabbed && target != virtual_target {
+            if let Err(error) = device.ungrab() {
+                set_device_error(
+                    &status,
+                    &path_key,
+                    format!(
+                        "Cannot release controller before changing its virtual layout: {error}"
+                    ),
+                );
+                break;
+            }
+            virtual_device = None;
+            grabbed = false;
+            virtual_target = None;
+            set_device_active(&status, &path_key, false);
+        }
+
+        if let Some(target) = target
+            && !grabbed
+        {
+            match VirtualPad::create(&device, target) {
                 Ok(new_virtual) => {
                     if let Err(error) = device.grab() {
                         set_device_error(
@@ -772,6 +1222,7 @@ fn controller_worker(
                     } else {
                         virtual_device = Some(new_virtual);
                         grabbed = true;
+                        virtual_target = Some(target);
                         set_device_active(&status, &path_key, true);
                     }
                 }
@@ -787,7 +1238,7 @@ fn controller_worker(
                     continue;
                 }
             }
-        } else if current_layout.is_none() && grabbed {
+        } else if target.is_none() && grabbed {
             if let Err(error) = device.ungrab() {
                 set_device_error(
                     &status,
@@ -797,21 +1248,18 @@ fn controller_worker(
             }
             virtual_device = None;
             grabbed = false;
+            virtual_target = None;
             set_device_active(&status, &path_key, false);
         }
 
         match device.fetch_events() {
             Ok(events) => {
+                let (source, target) = current_conversion.unwrap_or((Layout::Xbox, Layout::Xbox));
                 let mapped = events
-                    .filter(|event| {
-                        event.event_type() == EventType::KEY
-                            || event.event_type() == EventType::ABSOLUTE
-                    })
-                    .map(|event| map_event(event, current_layout.unwrap_or(Layout::Xbox)))
+                    .map(|event| map_event(event, source, target))
                     .collect::<Vec<_>>();
                 if let Some(virtual_device) = virtual_device.as_mut()
-                    && !mapped.is_empty()
-                    && let Err(error) = virtual_device.emit(&mapped)
+                    && let Err(error) = virtual_device.emit(mapped)
                 {
                     set_device_error(
                         &status,
@@ -822,6 +1270,8 @@ fn controller_worker(
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            // Unplugged or powered off: not an error, the worker just ends.
+            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => break,
             Err(error) => {
                 set_device_error(
                     &status,
@@ -831,7 +1281,16 @@ fn controller_worker(
                 break;
             }
         }
-        thread::sleep(Duration::from_millis(4));
+        if let Some(virtual_device) = virtual_device.as_mut()
+            && let Err(error) = virtual_device.forward_rumble(&mut device)
+        {
+            eprintln!("controller {path_key}: cannot forward rumble: {error}");
+        }
+        wait_for_input(
+            &device,
+            virtual_device.as_ref().map(VirtualPad::as_raw_fd),
+            Duration::from_millis(100),
+        );
     }
 
     if grabbed {
@@ -840,22 +1299,27 @@ fn controller_worker(
     drop(virtual_device);
 }
 
-fn create_virtual_device(device: &Device, name: &str) -> Result<VirtualDevice, std::io::Error> {
-    let keys: AttributeSet<KeyCode> = device
-        .supported_keys()
+/// Sleeps until the controller has input, a game sends rumble to the virtual
+/// pad, or `timeout` passes, so neither waits on a polling delay while profile
+/// changes are still noticed.
+fn wait_for_input(device: &Device, virtual_fd: Option<i32>, timeout: Duration) {
+    let mut poll_fds = [device.as_raw_fd()]
         .into_iter()
-        .flat_map(|keys| keys.iter())
-        .collect();
-    let virtual_name = format!("Switch Swap - {name}");
-    let mut builder = VirtualDevice::builder()?
-        .name(&virtual_name)
-        .input_id(device.input_id())
-        .with_keys(&keys)?;
-
-    for (axis, info) in device.get_absinfo()? {
-        builder = builder.with_absolute_axis(&UinputAbsSetup::new(axis, info))?;
+        .chain(virtual_fd)
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect::<Vec<_>>();
+    let timeout = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    unsafe {
+        libc::poll(
+            poll_fds.as_mut_ptr(),
+            poll_fds.len() as libc::nfds_t,
+            timeout,
+        );
     }
-    builder.build()
 }
 
 fn set_device_active(status: &Arc<Mutex<ServiceStatus>>, path: &str, active: bool) {
@@ -889,7 +1353,9 @@ mod tests {
                 "abcd".to_owned(),
                 ControllerProfile {
                     name: "Test controller".to_owned(),
-                    layout: Layout::Switch,
+                    source_layout: Layout::Switch,
+                    target_layout: Layout::Xbox,
+                    hidraw: BTreeSet::new(),
                 },
             )]),
             legacy_global_setting: false,
@@ -911,9 +1377,9 @@ mod tests {
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
 
-        assert!(response.starts_with("OK\nprotocol=3\n"));
+        assert!(response.starts_with("OK\nprotocol=4\n"));
         assert!(response.contains("device=abcd|Test controller|true|"));
-        assert!(response.contains("profile=abcd|switch|Test controller"));
+        assert!(response.contains("profile=abcd|switch|xbox|Test controller"));
         assert!(response.contains("repair_required=true\n"));
     }
 
@@ -922,7 +1388,7 @@ mod tests {
         let settings = Arc::new(Mutex::new(Settings::default()));
         let status = Arc::new(Mutex::new(ServiceStatus::default()));
         let (mut client, service) = UnixStream::pair().unwrap();
-        client.write_all(b"APPLY not-a-layout abcd\n").unwrap();
+        client.write_all(b"APPLY not-a-layout xbox abcd\n").unwrap();
         handle_client(service, &settings, &status).unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
@@ -940,7 +1406,7 @@ mod tests {
         let settings = Arc::new(Mutex::new(Settings::default()));
         let status = Arc::new(Mutex::new(ServiceStatus::default()));
         let (mut client, service) = UnixStream::pair().unwrap();
-        client.write_all(b"APPLY switch abcd\n").unwrap();
+        client.write_all(b"APPLY xbox switch abcd\n").unwrap();
         handle_client(service, &settings, &status).unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
@@ -964,15 +1430,26 @@ mod tests {
                 "first".to_owned(),
                 ControllerProfile {
                     name: "First controller".to_owned(),
-                    layout: Layout::Switch,
+                    source_layout: Layout::Xbox,
+                    target_layout: Layout::Switch,
+                    hidraw: BTreeSet::new(),
                 },
             )]),
             legacy_global_setting: true,
         };
-        let updated = with_profile(&settings, "second", "Second controller", Layout::Xbox);
+        let updated = with_profile(
+            &settings,
+            "second",
+            "Second controller",
+            Layout::Switch,
+            Layout::Xbox,
+            Some("uniq=AA".to_owned()),
+        );
         assert_eq!(updated.profiles.len(), 2);
-        assert_eq!(updated.profiles["first"].layout, Layout::Switch);
-        assert_eq!(updated.profiles["second"].layout, Layout::Xbox);
+        assert!(updated.profiles["second"].hidraw.contains("uniq=AA"));
+        assert_eq!(updated.profiles["first"].target_layout, Layout::Switch);
+        assert_eq!(updated.profiles["second"].source_layout, Layout::Switch);
+        assert_eq!(updated.profiles["second"].target_layout, Layout::Xbox);
         assert!(!updated.legacy_global_setting);
     }
 
@@ -988,7 +1465,45 @@ mod tests {
         let settings = parse_settings("version=2\ndevice=abcd|switch|Pro Controller\n").unwrap();
         assert!(!settings.legacy_global_setting);
         assert_eq!(settings.profiles.len(), 1);
-        assert_eq!(settings.profiles["abcd"].layout, Layout::Switch);
+        assert_eq!(settings.profiles["abcd"].source_layout, Layout::Xbox);
+        assert_eq!(settings.profiles["abcd"].target_layout, Layout::Switch);
         assert_eq!(settings.profiles["abcd"].name, "Pro Controller");
+    }
+
+    #[test]
+    fn version_three_settings_restore_both_conversion_directions() {
+        let settings =
+            parse_settings("version=3\ndevice=abcd|switch|xbox|Pro Controller\n").unwrap();
+        assert_eq!(settings.profiles["abcd"].source_layout, Layout::Switch);
+        assert_eq!(settings.profiles["abcd"].target_layout, Layout::Xbox);
+    }
+
+    #[test]
+    fn version_four_settings_keep_learned_hidraw_matches() {
+        let settings = parse_settings(
+            "version=4\ndevice=abcd|switch|xbox|Pro Controller\nhidraw=abcd|uniq=000000000001\n",
+        )
+        .unwrap();
+        assert!(
+            settings.profiles["abcd"]
+                .hidraw
+                .contains("uniq=000000000001")
+        );
+    }
+
+    #[test]
+    fn connected_controllers_move_legacy_profiles_and_learn_hidraw() {
+        let mut settings = parse_settings("version=3\ndevice=0011|switch|xbox|Pro\n").unwrap();
+        let controller = DiscoveredController {
+            path: PathBuf::from("/dev/input/event9"),
+            id: "2233".to_owned(),
+            legacy_id: "0011".to_owned(),
+            hidraw: Some("uniq=e4:17".to_owned()),
+            name: "Pro".to_owned(),
+        };
+        assert!(update_connected_profile(&mut settings, &controller));
+        assert!(!settings.profiles.contains_key("0011"));
+        assert!(settings.profiles["2233"].hidraw.contains("uniq=e4:17"));
+        assert!(!update_connected_profile(&mut settings, &controller));
     }
 }

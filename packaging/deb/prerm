@@ -1,6 +1,7 @@
 #!/bin/sh
 set -e
-if [ "$1" = remove ]; then
-    deb-systemd-invoke stop switch-swap.service
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    # Stopping also gives the controllers back to games (ExecStopPost).
+    systemctl stop switch-swap.service || true
 fi
 exit 0

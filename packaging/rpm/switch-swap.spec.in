@@ -1,0 +1,49 @@
+Name:           switch-swap
+Version:        @VERSION@
+Release:        1
+Summary:        Make any game controller play as an Xbox or Switch controller
+License:        GPL-3.0-or-later
+URL:            https://github.com/sweatshopking/switch-swap
+# Library dependencies (GTK 4 and so on) are found automatically from the binary.
+Requires:       systemd
+Requires:       polkit
+# pkexec is its own package on openSUSE; the file pulls in the right one anywhere.
+Requires:       /usr/bin/pkexec
+
+%description
+Switch Swap presents a chosen game controller to games as a wired Xbox 360
+pad or a Nintendo Switch Pro Controller, keeping button positions, passing
+rumble through, and hiding the original so games see only one controller.
+
+%install
+cp -a %{stage}/. %{buildroot}/
+
+%post
+# Not in a running system (an image build or container): nothing to start.
+[ -d /run/systemd/system ] || exit 0
+systemctl daemon-reload || :
+if [ "$1" -gt 1 ] && systemctl is-active --quiet switch-swap.service; then
+    systemctl restart switch-swap.service || :
+else
+    systemctl enable --now switch-swap.service || :
+fi
+
+%preun
+if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
+    systemctl disable --now switch-swap.service || :
+fi
+
+%postun
+[ -d /run/systemd/system ] && systemctl daemon-reload || :
+
+%files
+%license /usr/share/licenses/switch-swap/LICENSE
+%{_bindir}/switch-swap
+/usr/lib/systemd/system/switch-swap.service
+%dir /usr/lib/systemd/system/switch-swap.service.d
+/usr/lib/systemd/system/switch-swap.service.d/10-controller-device-access.conf
+%dir %{_sysconfdir}/switch-swap
+%config(noreplace) %{_sysconfdir}/switch-swap/settings.conf
+%{_datadir}/applications/io.github.switchswap.SwitchSwap.desktop
+%{_datadir}/icons/hicolor/scalable/apps/io.github.switchswap.SwitchSwap.svg
+%{_datadir}/icons/hicolor/scalable/apps/io.github.switchswap.SwitchSwap-symbolic.svg

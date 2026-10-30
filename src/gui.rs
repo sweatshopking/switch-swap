@@ -1,7 +1,10 @@
 use crate::SOCKET_PATH;
+use crate::update::{self, Preferences};
 use gtk::glib;
 use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow, Button, DropDown, Label, Orientation, StringList};
+use gtk::{
+    Application, ApplicationWindow, Button, CheckButton, DropDown, Label, Orientation, StringList,
+};
 use std::cell::RefCell;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -15,9 +18,15 @@ struct Controller {
     id: String,
     name: String,
     connected: bool,
-    layout: Option<String>,
+    conversion: Option<Conversion>,
     active: bool,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct Conversion {
+    source: String,
+    target: String,
 }
 
 #[derive(Debug, Default)]
@@ -29,12 +38,17 @@ struct ServiceSnapshot {
     candidates: Vec<String>,
     errors: Vec<String>,
     repair_required: bool,
+    /// The running service's version; None for services older than 0.2.0.
+    version: Option<String>,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let application = Application::builder()
-        .application_id("io.github.switchswap.SwitchSwap")
-        .build();
+    let mut builder = Application::builder().application_id("io.github.switchswap.SwitchSwap");
+    // Debug builds open their own window instead of raising an installed copy.
+    if cfg!(debug_assertions) {
+        builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let application = builder.build();
     application.connect_activate(build_window);
     application.run();
     Ok(())
@@ -48,7 +62,7 @@ fn build_window(application: &Application) {
     details.set_wrap(true);
     details.set_xalign(0.0);
     let setup = Label::new(Some(
-        "Connect your controller, select it below, then choose its button layout.",
+        "Select a controller, then choose which controller games should see. Buttons keep their physical positions: the bottom face button is always the confirm button in Xbox-style games.",
     ));
     setup.set_wrap(true);
     setup.set_xalign(0.0);
@@ -57,8 +71,11 @@ fn build_window(application: &Application) {
     let controller_dropdown =
         DropDown::new(Some(controller_model.clone()), None::<gtk::Expression>);
     controller_dropdown.set_hexpand(true);
-    let xbox = Button::with_label("Use Xbox button layout");
-    let switch = Button::with_label("Use Nintendo Switch button layout");
+    let xbox = Button::with_label("Play as Xbox controller");
+    let switch = Button::with_label("Play as Nintendo Switch controller");
+    let swap_letters = CheckButton::with_label(
+        "Also swap A/B and X/Y (only if this controller's buttons come out in the wrong places)",
+    );
     let undo = Button::with_label("Undo selected controller");
     let action_message = Rc::new(RefCell::new(String::new()));
     let pending_child = Rc::new(RefCell::new(None::<Child>));
@@ -82,7 +99,8 @@ fn build_window(application: &Application) {
         });
     }
 
-    for (button, layout) in [(xbox.clone(), "xbox"), (switch.clone(), "switch")] {
+    for (button, target) in [(xbox.clone(), "xbox"), (switch.clone(), "switch")] {
+        let swap_letters = swap_letters.clone();
         let action_message = Rc::clone(&action_message);
         let pending_child = Rc::clone(&pending_child);
         let executable = executable.clone();
@@ -99,10 +117,16 @@ fn build_window(application: &Application) {
                         .to_owned();
                 return;
             }
+            // The service swaps face buttons whenever source and target differ.
+            let source = match (swap_letters.is_active(), target) {
+                (false, target) => target,
+                (true, "xbox") => "switch",
+                (true, _) => "xbox",
+            };
             start_admin_request(
                 executable.as_ref(),
                 "apply",
-                &[layout, &controller.id],
+                &[source, target, &controller.id],
                 &pending_child,
                 &action_message,
             );
@@ -121,7 +145,7 @@ fn build_window(application: &Application) {
                     "Select a controller with a saved layout first.".to_owned();
                 return;
             };
-            if controller.layout.is_none() {
+            if controller.conversion.is_none() {
                 *action_message.borrow_mut() =
                     "The selected controller has no saved remapping to undo.".to_owned();
                 return;
@@ -148,18 +172,62 @@ fn build_window(application: &Application) {
     title.add_css_class("title-1");
     brand.append(&title);
     content.append(&brand);
+    let preferences = Rc::new(RefCell::new(Preferences::load()));
+    let updates = UpdateBanner::new(Rc::clone(&preferences));
+    content.append(&updates.container);
     content.append(&setup);
     content.append(&install_service);
     content.append(&status);
-    content.append(&Label::new(Some("Controller to configure")));
+    let controller_heading = Label::new(Some("Controller"));
+    controller_heading.set_xalign(0.0);
+    controller_heading.add_css_class("heading");
+    content.append(&controller_heading);
     content.append(&controller_dropdown);
     content.append(&details);
     content.append(&xbox);
     content.append(&switch);
+    content.append(&swap_letters);
     content.append(&undo);
-    content.append(&Label::new(Some(
-        "Only the selected controller is changed. Each controller keeps its own layout.",
-    )));
+    let footer = Label::new(Some(
+        "Only the selected controller is changed, and its choice is remembered for next time. Restart games that were already open.",
+    ));
+    footer.set_wrap(true);
+    footer.set_xalign(0.0);
+    content.append(&footer);
+    let help_row = gtk::Box::new(Orientation::Horizontal, 12);
+    help_row.append(&updates.toggle);
+    let report_bug = Button::with_label("Report a problem…");
+    report_bug.set_hexpand(true);
+    report_bug.set_halign(gtk::Align::End);
+    help_row.append(&report_bug);
+    content.append(&help_row);
+    {
+        let action_message = Rc::clone(&action_message);
+        report_bug.connect_clicked(move |button| {
+            let button = button.clone();
+            let action_message = Rc::clone(&action_message);
+            button.set_sensitive(false);
+            glib::spawn_future_local(async move {
+                let report = gtk::gio::spawn_blocking(crate::report::generate)
+                    .await
+                    .unwrap_or_default();
+                button.clipboard().set_text(&report);
+                *action_message.borrow_mut() =
+                    "A bug report is copied. Paste it into the form that opened in your browser."
+                        .to_owned();
+                if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
+                    crate::report::ISSUES_URL,
+                    None::<&gtk::gio::AppLaunchContext>,
+                ) {
+                    *action_message.borrow_mut() = format!(
+                        "A bug report is copied. Open {} and paste it there ({error}).",
+                        crate::report::ISSUES_URL
+                    );
+                }
+                button.set_sensitive(true);
+            });
+        });
+    }
 
     let window = ApplicationWindow::builder()
         .application(application)
@@ -170,6 +238,15 @@ fn build_window(application: &Application) {
         .build();
     window.set_icon_name(Some("io.github.switchswap.SwitchSwap"));
     window.present();
+    updates.check();
+    {
+        // While the window stays open, look again once a day.
+        let updates = updates.clone();
+        glib::timeout_add_seconds_local(24 * 60 * 60, move || {
+            updates.check();
+            glib::ControlFlow::Continue
+        });
+    }
 
     let status_label = status.clone();
     let details_label = details.clone();
@@ -194,11 +271,18 @@ fn build_window(application: &Application) {
                 if labels.is_empty() {
                     labels.push("No compatible controllers currently detected".to_owned());
                 }
-                model.splice(
-                    0,
-                    model.n_items(),
-                    &labels.iter().map(String::as_str).collect::<Vec<_>>(),
-                );
+                // Replacing the list closes an open dropdown, so only do it on change.
+                let current = (0..model.n_items())
+                    .filter_map(|index| model.string(index))
+                    .map(String::from)
+                    .collect::<Vec<_>>();
+                if current != labels {
+                    model.splice(
+                        0,
+                        model.n_items(),
+                        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+                    );
+                }
                 let selected = previous_id
                     .and_then(|id| choices.iter().position(|controller| controller.id == id))
                     .or_else(|| choices.iter().position(|controller| controller.connected));
@@ -236,19 +320,35 @@ fn build_window(application: &Application) {
                 detail_lines.extend(snapshot.candidates);
                 detail_lines.extend(snapshot.errors);
                 details_label.set_text(&detail_lines.join("\n"));
+                // Only offer to replace an older service: replacing a newer one
+                // with this window's copy would downgrade it.
+                let window_version = env!("CARGO_PKG_VERSION");
+                let outdated = snapshot
+                    .version
+                    .as_deref()
+                    .is_none_or(|service| update::is_newer(window_version, service));
+                let window_outdated = snapshot
+                    .version
+                    .as_deref()
+                    .is_some_and(|service| update::is_newer(service, window_version));
                 setup_label.set_text(if snapshot.repair_required {
-                    "The service needs a device-access update before it can inspect controllers."
+                    "The system service needs an update before it can read controllers. Click Update system service."
+                } else if outdated {
+                    "The system service is from an older version of Switch Swap. Click Update system service to finish updating."
+                } else if window_outdated {
+                    "This window is from an older version than the one installed. Close it and open Switch Swap from your app menu."
                 } else {
-                    "Select a connected controller. Layout changes apply only to that controller and are saved for future connections."
+                    "Pick your controller, then choose which controller games should see."
                 });
-                install_button.set_visible(snapshot.repair_required);
+                install_button.set_label("Update system service…");
+                install_button.set_visible(snapshot.repair_required || outdated);
                 dropdown.set_sensitive(true);
                 let connected = selected
                     .as_ref()
                     .is_some_and(|controller| controller.connected);
                 let has_profile = selected
                     .as_ref()
-                    .is_some_and(|controller| controller.layout.is_some());
+                    .is_some_and(|controller| controller.conversion.is_some());
                 xbox_button.set_sensitive(connected);
                 switch_button.set_sensitive(connected);
                 undo_button.set_sensitive(has_profile);
@@ -261,6 +361,7 @@ fn build_window(application: &Application) {
                 setup_label.set_text(
                     "First-time setup — install the service with administrator approval, then connect and select a controller.",
                 );
+                install_button.set_label("Install or update system service…");
                 install_button.set_visible(true);
                 dropdown.set_sensitive(false);
                 xbox_button.set_sensitive(false);
@@ -270,6 +371,103 @@ fn build_window(application: &Application) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// "A new version is out" banner and the setting that turns the check off.
+#[derive(Clone)]
+struct UpdateBanner {
+    container: gtk::Box,
+    message: Label,
+    toggle: CheckButton,
+    offered: Rc<RefCell<Option<String>>>,
+    preferences: Rc<RefCell<Preferences>>,
+}
+
+impl UpdateBanner {
+    fn new(preferences: Rc<RefCell<Preferences>>) -> Self {
+        let container = gtk::Box::new(Orientation::Vertical, 6);
+        container.add_css_class("card");
+        container.set_visible(false);
+        let message = Label::new(None);
+        message.set_wrap(true);
+        message.set_xalign(0.0);
+        let buttons = gtk::Box::new(Orientation::Horizontal, 6);
+        let open = Button::with_label("Open download page");
+        open.add_css_class("suggested-action");
+        let skip = Button::with_label("Skip this version");
+        buttons.append(&open);
+        buttons.append(&skip);
+        container.append(&message);
+        container.append(&buttons);
+        let toggle = CheckButton::with_label("Tell me when a new version is out");
+        toggle.set_active(preferences.borrow().check_for_updates);
+        let banner = Self {
+            container,
+            message,
+            toggle,
+            offered: Rc::new(RefCell::new(None)),
+            preferences,
+        };
+
+        open.connect_clicked(|_| {
+            if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
+                update::RELEASES_URL,
+                None::<&gtk::gio::AppLaunchContext>,
+            ) {
+                eprintln!("Cannot open {}: {error}", update::RELEASES_URL);
+            }
+        });
+        {
+            let banner = banner.clone();
+            skip.connect_clicked(move |_| {
+                let version = banner.offered.borrow().clone();
+                banner.preferences.borrow_mut().skipped_version = version;
+                banner.save();
+                banner.container.set_visible(false);
+            });
+        }
+        {
+            let banner = banner.clone();
+            banner.toggle.clone().connect_toggled(move |toggle| {
+                banner.preferences.borrow_mut().check_for_updates = toggle.is_active();
+                banner.save();
+                if toggle.is_active() {
+                    banner.check();
+                } else {
+                    banner.container.set_visible(false);
+                }
+            });
+        }
+        banner
+    }
+
+    fn save(&self) {
+        if let Err(error) = self.preferences.borrow().save() {
+            eprintln!("Cannot save Switch Swap settings: {error}");
+        }
+    }
+
+    /// Asks GitHub in the background; shows the banner if a newer version is out.
+    fn check(&self) {
+        if !self.preferences.borrow().check_for_updates {
+            return;
+        }
+        let banner = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(Some(version)) = gtk::gio::spawn_blocking(update::newer_version).await else {
+                return;
+            };
+            if !banner.preferences.borrow().should_offer(&version) {
+                return;
+            }
+            banner.message.set_text(&format!(
+                "Switch Swap {version} is out (you have {}). Download it and install it the same way as before.",
+                env!("CARGO_PKG_VERSION")
+            ));
+            *banner.offered.borrow_mut() = Some(version);
+            banner.container.set_visible(true);
+        });
+    }
 }
 
 fn start_admin_request(
@@ -385,7 +583,7 @@ fn controller_choices(snapshot: &ServiceSnapshot) -> (Vec<Controller>, Vec<Strin
     let mut choices = snapshot.devices.clone();
     for mut profile in snapshot.profiles.clone() {
         if let Some(connected) = choices.iter_mut().find(|device| device.id == profile.id) {
-            connected.layout = profile.layout.take();
+            connected.conversion = profile.conversion.take();
         } else {
             choices.push(profile);
         }
@@ -400,10 +598,18 @@ fn controller_choices(snapshot: &ServiceSnapshot) -> (Vec<Controller>, Vec<Strin
     let labels = choices
         .iter()
         .map(|controller| {
-            let layout = match controller.layout.as_deref() {
-                Some("switch") => "Nintendo Switch layout",
-                Some(_) => "Xbox layout",
-                None => "not remapped",
+            let layout = match &controller.conversion {
+                Some(conversion) => {
+                    if conversion.source == conversion.target {
+                        format!("plays as {}", layout_name(&conversion.target))
+                    } else {
+                        format!(
+                            "plays as {}, A/B and X/Y swapped",
+                            layout_name(&conversion.target)
+                        )
+                    }
+                }
+                None => "not remapped".to_owned(),
             };
             let connection = if controller.connected {
                 if controller.active {
@@ -420,8 +626,21 @@ fn controller_choices(snapshot: &ServiceSnapshot) -> (Vec<Controller>, Vec<Strin
     (choices, labels)
 }
 
+fn layout_name(layout: &str) -> &str {
+    match layout {
+        "switch" => "Nintendo Switch",
+        _ => "Xbox",
+    }
+}
+
 fn read_status() -> Result<ServiceSnapshot, String> {
-    let mut stream = UnixStream::connect(SOCKET_PATH).map_err(|error| {
+    // Debug builds can talk to a stand-in service, for screenshots and testing.
+    let socket_path = if cfg!(debug_assertions) {
+        std::env::var("SWITCH_SWAP_TEST_SOCKET").unwrap_or_else(|_| SOCKET_PATH.to_owned())
+    } else {
+        SOCKET_PATH.to_owned()
+    };
+    let mut stream = UnixStream::connect(&socket_path).map_err(|error| {
         format!("System service unavailable ({error}). Install and start switch-swap.service.")
     })?;
     stream
@@ -444,7 +663,7 @@ fn parse_status(body: &str) -> Result<ServiceSnapshot, String> {
     let mut snapshot = ServiceSnapshot::default();
     let mut current_protocol = false;
     for line in body.lines().skip(1) {
-        if line == "protocol=3" {
+        if line == "protocol=4" {
             current_protocol = true;
         } else if let Some(value) = line.strip_prefix("message=") {
             snapshot.message = Some(value.to_owned());
@@ -459,20 +678,23 @@ fn parse_status(body: &str) -> Result<ServiceSnapshot, String> {
                 id: fields[0].to_owned(),
                 name: fields[1].to_owned(),
                 connected: true,
-                layout: None,
+                conversion: None,
                 active: fields[2] == "true",
                 error: (!fields[3].is_empty()).then(|| fields[3].to_owned()),
             });
         } else if let Some(value) = line.strip_prefix("profile=") {
-            let fields = value.splitn(3, '|').collect::<Vec<_>>();
-            if fields.len() != 3 {
+            let fields = value.splitn(4, '|').collect::<Vec<_>>();
+            if fields.len() != 4 {
                 return Err("The service returned a malformed saved profile.".to_owned());
             }
             snapshot.profiles.push(Controller {
                 id: fields[0].to_owned(),
-                name: fields[2].to_owned(),
+                name: fields[3].to_owned(),
                 connected: false,
-                layout: Some(fields[1].to_owned()),
+                conversion: Some(Conversion {
+                    source: fields[1].to_owned(),
+                    target: fields[2].to_owned(),
+                }),
                 active: false,
                 error: None,
             });
@@ -487,11 +709,13 @@ fn parse_status(body: &str) -> Result<ServiceSnapshot, String> {
             snapshot.errors.push(value.to_owned());
         } else if let Some(value) = line.strip_prefix("repair_required=") {
             snapshot.repair_required = value == "true";
+        } else if let Some(value) = line.strip_prefix("version=") {
+            snapshot.version = Some(value.to_owned());
         }
     }
     if !current_protocol {
         return Err(
-            "The installed system service is outdated. Select Install system service to update it."
+            "The system service is from an older version of Switch Swap. Click Update system service to finish updating."
                 .to_owned(),
         );
     }
@@ -505,24 +729,31 @@ mod tests {
     #[test]
     fn status_parser_lists_devices_profiles_and_diagnostics() {
         let snapshot = parse_status(
-            "OK\nprotocol=3\nmessage=Select one controller\nwarning=Legacy setting disabled\n\
+            "OK\nprotocol=4\nmessage=Select one controller\nwarning=Legacy setting disabled\n\
              repair_required=true\n\
              device=abcd|Controller One|true|\n\
-             profile=abcd|switch|Controller One\n\
+             profile=abcd|switch|xbox|Controller One\n\
              candidate=Controller Two (event3)|missing ABS_X\n",
         )
         .unwrap();
         assert_eq!(snapshot.devices.len(), 1);
         assert_eq!(snapshot.devices[0].id, "abcd");
-        assert_eq!(snapshot.profiles[0].layout.as_deref(), Some("switch"));
+        assert_eq!(
+            snapshot.profiles[0].conversion.as_ref().unwrap().source,
+            "switch"
+        );
+        assert_eq!(
+            snapshot.profiles[0].conversion.as_ref().unwrap().target,
+            "xbox"
+        );
         assert!(snapshot.candidates[0].contains("missing ABS_X"));
         assert!(snapshot.repair_required);
     }
 
     #[test]
     fn status_parser_rejects_the_legacy_global_service_protocol() {
-        let error = parse_status("OK\nprotocol=2\n").unwrap_err();
-        assert!(error.contains("service is outdated"));
+        let error = parse_status("OK\nprotocol=3\n").unwrap_err();
+        assert!(error.contains("older version of Switch Swap"));
     }
 
     #[test]
@@ -532,7 +763,7 @@ mod tests {
                 id: "one".to_owned(),
                 name: "Xbox".to_owned(),
                 connected: true,
-                layout: None,
+                conversion: None,
                 active: false,
                 error: None,
             }],
@@ -540,7 +771,10 @@ mod tests {
                 id: "two".to_owned(),
                 name: "Switch".to_owned(),
                 connected: false,
-                layout: Some("switch".to_owned()),
+                conversion: Some(Conversion {
+                    source: "xbox".to_owned(),
+                    target: "switch".to_owned(),
+                }),
                 active: false,
                 error: None,
             }],
@@ -552,5 +786,6 @@ mod tests {
         assert!(labels[0].contains("not remapped"));
         assert!(!choices[1].connected);
         assert!(labels[1].contains("saved, disconnected"));
+        assert!(labels[1].contains("plays as Nintendo Switch, A/B and X/Y swapped"));
     }
 }

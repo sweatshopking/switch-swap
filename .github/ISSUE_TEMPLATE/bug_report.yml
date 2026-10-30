@@ -1,0 +1,55 @@
+name: Report a problem
+description: Something doesn't work the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this! The quickest way to give us everything we need:
+        open Switch Swap and click **Report a problem…** (bottom right). It copies a bug report;
+        paste it in the last box below. If the window won't open, run `switch-swap report` in a
+        terminal instead (AppImage: `./Switch-Swap-*.AppImage report`) and paste what it prints.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, and what went wrong? For example "Pressed A in Hollow Knight, it jumped instead of confirming".
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: input
+    id: controller
+    attributes:
+      label: Controller
+      description: Make and model, and how it's connected. For example "Nintendo Switch Pro Controller, Bluetooth".
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Game and how you launch it
+      description: For example "Axiom Verge 2, Heroic, Proton-GE" or "Celeste, Steam, native".
+  - type: dropdown
+    id: choice
+    attributes:
+      label: What is the controller set to?
+      options:
+        - Play as Xbox controller
+        - Play as Xbox controller, with A/B and X/Y swapped
+        - Play as Nintendo Switch controller
+        - Play as Nintendo Switch controller, with A/B and X/Y swapped
+        - Nothing (not remapped)
+        - It doesn't appear in the list
+  - type: textarea
+    id: report
+    attributes:
+      label: Bug report
+      description: Paste what "Report a problem…" copied, or what `switch-swap report` printed.
+      placeholder: "### Switch Swap bug report ..."
+    validations:
+      required: true

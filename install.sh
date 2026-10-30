@@ -14,12 +14,18 @@ if [[ ! -x "${binary}" ]]; then
 fi
 
 install -Dm755 "${binary}" /usr/bin/switch-swap
+install -Dm644 "${project_dir}/packaging/io.github.switchswap.SwitchSwap.desktop" \
+    /usr/share/applications/io.github.switchswap.SwitchSwap.desktop
+install -Dm644 "${project_dir}/packaging/io.github.switchswap.SwitchSwap.svg" \
+    /usr/share/icons/hicolor/scalable/apps/io.github.switchswap.SwitchSwap.svg
+install -Dm644 "${project_dir}/packaging/io.github.switchswap.SwitchSwap-symbolic.svg" \
+    /usr/share/icons/hicolor/scalable/apps/io.github.switchswap.SwitchSwap-symbolic.svg
 install -Dm644 "${project_dir}/systemd/switch-swap.service" \
     /etc/systemd/system/switch-swap.service
 install -d -m755 /etc/switch-swap
 if [[ ! -e /etc/switch-swap/settings.conf ]]; then
     install -m600 /dev/null /etc/switch-swap/settings.conf
-    printf 'version=2\n' > /etc/switch-swap/settings.conf
+    printf 'version=4\n' > /etc/switch-swap/settings.conf
 fi
 install -d -m755 /run/switch-swap
 systemctl daemon-reload
