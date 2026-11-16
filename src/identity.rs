@@ -341,7 +341,9 @@ mod tests {
     #[test]
     fn bluetooth_uhid_controllers_are_not_virtual_but_uinput_pads_are() {
         // uinput: Switch Swap's own output, Steam Input, ydotool, ...
-        assert!(is_uinput_syspath(Path::new("/sys/devices/virtual/input/input30")));
+        assert!(is_uinput_syspath(Path::new(
+            "/sys/devices/virtual/input/input30"
+        )));
         // BlueZ creates Bluetooth HID controllers through uhid.
         assert!(!is_uinput_syspath(Path::new(
             "/sys/devices/virtual/misc/uhid/0005:045E:02E0.0007/input/input32"
@@ -351,7 +353,9 @@ mod tests {
             "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1:1.0/input/input5"
         )));
         // The directory name alone must not match (no prefix-only collision).
-        assert!(!is_uinput_syspath(Path::new("/sys/devices/virtual/inputx/input1")));
+        assert!(!is_uinput_syspath(Path::new(
+            "/sys/devices/virtual/inputx/input1"
+        )));
     }
 
     #[test]
