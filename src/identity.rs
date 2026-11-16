@@ -143,7 +143,14 @@ pub fn is_virtual_device(event_path: &Path) -> bool {
         .join(event)
         .join("device")
         .canonicalize()
-        .is_ok_and(|syspath| syspath.starts_with("/sys/devices/virtual"))
+        .is_ok_and(|syspath| is_uinput_syspath(&syspath))
+}
+
+/// uinput devices live in `/sys/devices/virtual/input/`. Bluetooth controllers
+/// are created through uhid by BlueZ and sit under `/sys/devices/virtual/misc/uhid/`;
+/// they are real controllers, so everything else under `virtual` is not skipped.
+fn is_uinput_syspath(syspath: &Path) -> bool {
+    syspath.starts_with("/sys/devices/virtual/input")
 }
 
 pub fn is_legacy_virtual_name(name: &str) -> bool {
@@ -222,8 +229,10 @@ const HIDE: &str = "ENV{ID_INPUT_JOYSTICK}=\"\", ENV{LIBINPUT_IGNORE_DEVICE}=\"1
 const HIDE_RAW: &str = "MODE:=\"0000\", TAG-=\"uaccess\"";
 /// HID_UNIQ and HID_PHYS live on the hidraw node's parent HID device.
 const IMPORT_HID: &str = "IMPORT{parent}=\"HID_*\"";
-/// Virtual devices (ours, Steam's, other remappers') are never hidden.
-const PHYSICAL_ONLY: &str = "DEVPATH!=\"/devices/virtual/*\"";
+/// Virtual (uinput) devices (ours, Steam's, other remappers') are never hidden.
+/// Bluetooth controllers are uhid devices under `/devices/virtual/misc/uhid/`
+/// and must still match, so only the uinput directory is excluded.
+const PHYSICAL_ONLY: &str = "DEVPATH!=\"/devices/virtual/input/*\"";
 
 pub fn rule_lines(selector: &Selector, hidraw_matches: &BTreeSet<String>) -> Vec<String> {
     let key = match selector {
@@ -330,6 +339,29 @@ mod tests {
     }
 
     #[test]
+    fn bluetooth_uhid_controllers_are_not_virtual_but_uinput_pads_are() {
+        // uinput: Switch Swap's own output, Steam Input, ydotool, ...
+        assert!(is_uinput_syspath(Path::new("/sys/devices/virtual/input/input30")));
+        // BlueZ creates Bluetooth HID controllers through uhid.
+        assert!(!is_uinput_syspath(Path::new(
+            "/sys/devices/virtual/misc/uhid/0005:045E:02E0.0007/input/input32"
+        )));
+        // USB and native-driver controllers.
+        assert!(!is_uinput_syspath(Path::new(
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1:1.0/input/input5"
+        )));
+        // The directory name alone must not match (no prefix-only collision).
+        assert!(!is_uinput_syspath(Path::new("/sys/devices/virtual/inputx/input1")));
+    }
+
+    #[test]
+    fn hide_rules_apply_to_bluetooth_uhid_devices() {
+        let rules = rule_lines(&Selector::Key(pro_controller()), &BTreeSet::new());
+        assert!(!rules[0].contains("DEVPATH!=\"/devices/virtual/*\""));
+        assert!(rules[0].contains("DEVPATH!=\"/devices/virtual/input/*\""));
+    }
+
+    #[test]
     fn identities_round_trip_and_ignore_the_bus() {
         let key = pro_controller();
         assert_eq!(selector_from_id(&key.encode()), Some(Selector::Key(key)));
@@ -339,7 +371,7 @@ mod tests {
     fn unique_rules_match_usb_and_bluetooth_and_skip_virtual_devices() {
         let rules = rule_lines(&Selector::Key(pro_controller()), &BTreeSet::new());
         assert!(rules[0].contains("KERNEL==\"event*|js*\""));
-        assert!(rules[0].contains("DEVPATH!=\"/devices/virtual/*\""));
+        assert!(rules[0].contains("DEVPATH!=\"/devices/virtual/input/*\""));
         assert!(rules[0].contains("ATTRS{id/vendor}==\"057e\", ATTRS{id/product}==\"2009\""));
         assert!(rules[0].contains("ATTRS{uniq}==\"E4:17:D8:D3:AD:15\""));
         assert!(rules[0].contains("MODE:=\"0000\", TAG-=\"uaccess\""));
