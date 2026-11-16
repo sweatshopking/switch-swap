@@ -30,6 +30,8 @@ fi
 install -d -m755 /run/switch-swap
 systemctl daemon-reload
 systemctl enable --now switch-swap.service
+# enable --now does not restart a running service: restart so the new binary is used
+systemctl restart switch-swap.service
 
 echo "Installed. Launch switch-swap as a regular user."
 echo "Select a controller before applying or undoing its layout; polkit authorization is required."
