@@ -5,7 +5,10 @@ After=systemd-udevd.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/switch-swap service
-ExecStopPost=/usr/bin/switch-swap restore-isolation
+# The program puts hidden controllers back when it stops; if it can't (it is broken or missing), this does, so a
+# service that fails never leaves a controller hidden (2026-11-20).
+ExecStopPost=-/usr/bin/switch-swap restore-isolation
+ExecStopPost=-/bin/sh -c 'f=/etc/udev/rules.d/72-switch-swap-isolation.rules; head -n1 "$$f" 2>/dev/null | grep -q "^# Managed by Switch Swap" || exit 0; rm -f "$$f"; udevadm control --reload; udevadm trigger --action=change --subsystem-match=input; udevadm trigger --action=change --subsystem-match=hidraw; exit 0'
 User=root
 Group=root
 RuntimeDirectory=switch-swap

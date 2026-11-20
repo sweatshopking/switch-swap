@@ -78,6 +78,18 @@ pub fn install_service() -> Result<(), Box<dyn Error>> {
             )
             .into());
         };
+        // An install that runs the plain program (/usr/bin, from a package or install.sh) gets the plain program, never
+        // the AppImage file: an AppImage can't run in the service's sandbox (no FUSE), so the service died and the
+        // controller it had hidden stayed hidden (2026-11-20). The AppImage carries the plain program inside it.
+        let binary_source =
+            if !is_appimage_install(&destination) && is_appimage_file(&binary_source) {
+                plain_program_in_appimage()?
+            } else {
+                binary_source
+            };
+        // the program that works now, kept until the new one has been seen running (see below)
+        let previous = backup_path(&destination);
+        let had_previous = destination.is_file() && fs::copy(&destination, &previous).is_ok();
         install_executable(&binary_source, &destination)?;
         install_menu_entry_if_possible(&destination);
         create_default_settings()?;
@@ -102,6 +114,21 @@ pub fn install_service() -> Result<(), Box<dyn Error>> {
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "--now", "switch-swap.service"])?;
         systemctl(&["restart", "switch-swap.service"])?;
+        // An update must never leave a dead service behind (2026-11-20: one did, and the controller it had hidden stayed
+        // hidden). If the new program isn't running a few seconds after the restart, the previous one goes back.
+        if !service_stays_up() {
+            if had_previous && fs::rename(&previous, &destination).is_ok() {
+                let _ = systemctl(&["reset-failed", "switch-swap.service"]);
+                let _ = systemctl(&["restart", "switch-swap.service"]);
+                return Err("The new version of the service did not start, so the previous version was put back. \
+                            Please use Report a problem."
+                    .into());
+            }
+            return Err(
+                "The new version of the service did not start. Please use Report a problem.".into(),
+            );
+        }
+        let _ = fs::remove_file(&previous);
         println!("Switch Swap application and system service updated.");
         return Ok(());
     }
@@ -155,6 +182,62 @@ fn install_executable(source: &Path, destination: &Path) -> Result<(), Box<dyn E
     fs::rename(&temporary, destination)
         .map_err(|error| format!("Cannot install {}: {error}", destination.display()))?;
     Ok(())
+}
+
+/// Whether the file is an AppImage (type 2: "AI" and 2 after the ELF header's first 8 bytes).
+fn is_appimage_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 11];
+    File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && &head[..4] == b"\x7fELF"
+        && &head[8..11] == b"AI\x02"
+}
+
+/// The plain program inside the running AppImage (its runtime sets APPDIR to where it is mounted).
+fn plain_program_in_appimage() -> Result<PathBuf, Box<dyn Error>> {
+    let program = std::env::var_os("APPDIR")
+        .map(|dir| PathBuf::from(dir).join("usr/bin/switch-swap"))
+        .filter(|path| path.is_file() && !is_appimage_file(path))
+        .ok_or("This Switch Swap is installed as a program, and the AppImage's own copy of it could not be found. Nothing was changed.")?;
+    Ok(program)
+}
+
+/// Where the program in use is kept while an update is checked.
+fn backup_path(destination: &Path) -> PathBuf {
+    let mut name = destination.as_os_str().to_owned();
+    name.push(".previous");
+    PathBuf::from(name)
+}
+
+/// The service is running a few seconds after a restart, and wasn't restarted by systemd meanwhile (a program that
+/// dies at once is restarted every 2 s: one look at the right moment could catch it "active").
+fn service_stays_up() -> bool {
+    let state = || {
+        Command::new("systemctl")
+            .args(["show", "-p", "ActiveState,NRestarts", "switch-swap.service"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let first = state();
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let second = state();
+    service_state_ok(&first, &second)
+}
+
+/// From two `systemctl show -p ActiveState,NRestarts` readings, seconds apart: active both times, no restart between.
+fn service_state_ok(first: &str, second: &str) -> bool {
+    let field = |text: &str, key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+            .map(str::to_owned)
+    };
+    let active = |text: &str| field(text, "ActiveState").as_deref() == Some("active");
+    active(first) && active(second) && field(first, "NRestarts") == field(second, "NRestarts")
 }
 
 fn is_appimage_install(path: &Path) -> bool {
@@ -298,5 +381,64 @@ mod tests {
         assert!(is_appimage_install(Path::new(APPIMAGE_PATHS[0])));
         assert!(!is_appimage_install(Path::new("/usr/bin/switch-swap")));
         assert!(!unit.contains("/usr/bin/switch-swap"));
+    }
+
+    #[test]
+    fn a_service_that_keeps_dying_is_not_taken_as_up() {
+        assert!(service_state_ok(
+            "ActiveState=active\nNRestarts=0\n",
+            "ActiveState=active\nNRestarts=0\n"
+        ));
+        // caught "active" twice, but systemd restarted it in between: it is dying and coming back
+        assert!(!service_state_ok(
+            "ActiveState=active\nNRestarts=1\n",
+            "ActiveState=active\nNRestarts=3\n"
+        ));
+        assert!(!service_state_ok(
+            "ActiveState=active\nNRestarts=0\n",
+            "ActiveState=failed\nNRestarts=4\n"
+        ));
+        assert!(!service_state_ok(
+            "ActiveState=activating\nNRestarts=0\n",
+            "ActiveState=active\nNRestarts=0\n"
+        ));
+        assert!(!service_state_ok("", ""));
+        assert_eq!(
+            backup_path(Path::new("/usr/bin/switch-swap")),
+            PathBuf::from("/usr/bin/switch-swap.previous")
+        );
+    }
+
+    #[test]
+    fn an_appimage_is_told_from_a_plain_program() {
+        let dir = std::env::temp_dir().join(format!("switch-swap-ai-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut ai = b"\x7fELF\x02\x01\x01\x00AI\x02".to_vec();
+        ai.extend_from_slice(&[0u8; 64]);
+        fs::write(dir.join("a.AppImage"), &ai).unwrap();
+        let mut plain = b"\x7fELF\x02\x01\x01\x00\x00\x00\x00".to_vec();
+        plain.extend_from_slice(&[0u8; 64]);
+        fs::write(dir.join("plain"), &plain).unwrap();
+        fs::write(dir.join("short"), b"\x7fEL").unwrap();
+        assert!(is_appimage_file(&dir.join("a.AppImage")));
+        assert!(!is_appimage_file(&dir.join("plain")));
+        assert!(!is_appimage_file(&dir.join("short")));
+        assert!(!is_appimage_file(&dir.join("missing")));
+        // the real program built here is not an AppImage
+        if let Ok(exe) = std::env::current_exe() {
+            assert!(!is_appimage_file(&exe));
+        }
+        // running an AppImage over a /usr/bin install: its own plain copy is used, found through APPDIR
+        fs::create_dir_all(dir.join("mnt/usr/bin")).unwrap();
+        fs::write(dir.join("mnt/usr/bin/switch-swap"), &plain).unwrap();
+        unsafe { std::env::set_var("APPDIR", dir.join("mnt")) };
+        assert_eq!(
+            plain_program_in_appimage().unwrap(),
+            dir.join("mnt/usr/bin/switch-swap")
+        );
+        unsafe { std::env::set_var("APPDIR", dir.join("nowhere")) };
+        assert!(plain_program_in_appimage().is_err());
+        unsafe { std::env::remove_var("APPDIR") };
+        let _ = fs::remove_dir_all(&dir);
     }
 }
